@@ -525,6 +525,3010 @@ while (1) {
     glEnd();
     glswapBuffers(window);
 }</pre>
+
+
+        <h3>Source Code</h3>
+        <pre><p>
+
+#include &lt;iostream&gt;
+#include &lt;fstream&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;unordered_map&gt;
+#include &lt;cctype&gt;
+#include &lt;cmath&gt;
+#include &lt;algorithm&gt;
+#include &lt;functional&gt;
+#include &lt;charconv&gt;
+#include &lt;unordered_set&gt;
+#include &lt;sstream&gt;
+#include &lt;filesystem&gt;  // C++17
+#include &lt;cstdlib&gt;     // for system()
+#include &lt;memory&gt;
+#include &lt;regex&gt;
+#include &lt;thread&gt;
+#include &lt;chrono&gt;
+#include &lt;optional&gt;
+#define NOMINMAX
+#include &lt;windows.h&gt;
+#include &lt;GL/gl.h&gt;
+#pragma comment(lib, "opengl32.lib")
+
+struct TailCallInfo;
+
+// ——— Value & Built‑ins —————————————————————————————————————————————
+struct Value {
+    enum Kind { NUM, STR, ARR, TAILCALL, STRUCT, PTR, NONE} kind;  // Added NONE kind
+    double num;
+    std::string str;
+    std::vector&lt;Value&gt; arr;
+    std::shared_ptr&lt;TailCallInfo&gt; tailcall;
+    std::unordered_map&lt;std::string,Value&gt; fields;
+    uintptr_t addr;
+
+    Value(): kind(NONE), num(0) {}  // Default constructor for empty value
+    Value(double d): kind(NUM), num(d) {}
+    Value(std::string s): kind(STR), num(0), str(std::move(s)) {}
+    Value(std::vector&lt;Value&gt; a): kind(ARR), num(0), arr(std::move(a)) {}
+    Value(const TailCallInfo& t)
+    : kind(TAILCALL),
+      num(0),
+      tailcall(std::make_shared&lt;TailCallInfo&gt;(t)) {}
+
+    static Value makeStruct(
+      const std::string& structName,
+      const std::vector&lt;Value&gt;& args);
+
+    bool isNone() const { return kind == NONE; }
+
+    // Operator+ for Value
+    Value operator+(const Value& rhs) const {
+        if (kind == NUM && rhs.kind == NUM) {
+            return Value(num + rhs.num);
+        }
+        if (kind == STR && rhs.kind == STR) {
+            return Value(str + rhs.str);
+        }
+        if (kind == ARR && rhs.kind == ARR) {
+            std::vector&lt;Value&gt; result = arr;
+            result.insert(result.end(), rhs.arr.begin(), rhs.arr.end());
+            return Value(std::move(result));
+        }
+        // Optionally, handle other combinations or error
+        std::cerr &lt;&lt; "Unsupported types for operator+\n";
+        return Value();
+    }
+
+    Value operator-(const Value& rhs) const {
+        if (kind == NUM && rhs.kind == NUM) {
+            return Value(num - rhs.num);
+        }
+        std::cerr &lt;&lt; "Type error: - only supports numbers\n";
+        return Value();
+    }
+};
+
+struct TailCallInfo {
+    std::string funcName;
+    std::vector&lt;Value&gt; args;
+    
+    TailCallInfo() = default;
+    TailCallInfo(const std::string& name, const std::vector&lt;Value&gt;& a)
+        : funcName(name), args(a) {}
+};
+
+
+using FuncPtr = std::function&lt;Value(const std::vector&lt;Value&gt;&)&gt;;
+
+struct Block { size_t start, size; bool free; };
+// Raw byte-addressable heap
+static std::vector&lt;uint8_t&gt; heap;
+// Free-list of blocks
+static std::vector&lt;Block&gt; blocks;
+
+// --- Windows API: MessageBox, ShellExecute, Beep, Clipboard, etc. ---
+static inline Value winmessageBoxFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 2 || args[0].kind != Value::STR || args[1].kind != Value::STR) {
+        std::cerr &lt;&lt; "messageBox: expects (string title, string message)\n";
+        return Value(0);
+    }
+    const std::string& title = args[0].str;
+    const std::string& message = args[1].str;
+    int flags = MB_OK;
+    if (args.size() &gt; 2 && args[2].kind == Value::NUM)
+        flags = static_cast&lt;int&gt;(args[2].num);
+    int result = MessageBoxA(NULL, message.c_str(), title.c_str(), flags);
+    return Value(static_cast&lt;double&gt;(result));
+}
+
+// Beep: simple sound
+static inline Value winBeepFn(const std::vector&lt;Value&gt;& args) {
+    int freq = (args.size() &gt; 0 && args[0].kind == Value::NUM) ? static_cast&lt;int&gt;(args[0].num) : 750;
+    int dur = (args.size() &gt; 1 && args[1].kind == Value::NUM) ? static_cast&lt;int&gt;(args[1].num) : 300;
+    BOOL ok = Beep(freq, dur);
+    return Value(ok ? 1.0 : 0.0);
+}
+
+static inline Value winShellExecuteFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 1 || args[0].kind != Value::STR) {
+        std::cerr &lt;&lt; "shellExecute: expects at least (string pathOrUrl)\n";
+        return Value(0);
+    }
+    const char* operation = "open";
+    const char* file = args[0].str.c_str();
+    const char* parameters = (args.size() &gt; 1 && args[1].kind == Value::STR) ? args[1].str.c_str() : NULL;
+    const char* directory = NULL;
+    int showCmd = SW_SHOWNORMAL;
+
+    HINSTANCE result = ShellExecuteA(NULL, operation, file, parameters, directory, showCmd);
+    return Value(reinterpret_cast&lt;intptr_t&gt;(result) &gt; 32 ? 1.0 : 0.0);
+}
+
+static inline Value winSetClipboardFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 1 || args[0].kind != Value::STR) {
+        std::cerr &lt;&lt; "setClipboard: expects (string text)\n";
+        return Value(0);
+    }
+    const std::string& text = args[0].str;
+
+    if (!OpenClipboard(NULL)) return Value(0);
+    EmptyClipboard();
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
+    if (!hMem) {
+        CloseClipboard();
+        return Value(0);
+    }
+
+    memcpy(GlobalLock(hMem), text.c_str(), text.size() + 1);
+    GlobalUnlock(hMem);
+    SetClipboardData(CF_TEXT, hMem);
+    CloseClipboard();
+    return Value(1.0);
+}
+
+static inline Value winSetCursorPosFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 2 || args[0].kind != Value::NUM || args[1].kind != Value::NUM) {
+        std::cerr &lt;&lt; "setCursorPos: expects (x, y)\n";
+        return Value(0);
+    }
+    int x = static_cast&lt;int&gt;(args[0].num);
+    int y = static_cast&lt;int&gt;(args[1].num);
+    BOOL result = SetCursorPos(x, y);
+    return Value(result ? 1.0 : 0.0);
+}
+
+static inline Value winRunProcessFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 1 || args[0].kind != Value::STR)
+        return Value(0);
+
+    std::string cmd = args[0].str;
+    if (args.size() &gt; 1 && args[1].kind == Value::STR)
+        cmd += " " + args[1].str;
+
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    BOOL result = CreateProcessA(NULL, cmd.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+    if (result) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return Value(1.0);
+    }
+    return Value(0.0);
+}
+
+
+static Value makePtr(uintptr_t address) {
+  Value v;
+  v.kind = Value::PTR;
+  v.addr = address;
+  return v;
+}
+
+static inline Value mallocFn(const std::vector&lt;Value&gt;& args) {
+  size_t n = static_cast&lt;size_t&gt;(args[0].num);
+  // Search free block
+  for (auto &b : blocks) {
+    if (b.free && b.size &gt;= n) {
+      size_t addr = b.start;
+      size_t leftover = b.size - n;
+      b.size = n;
+      b.free = false;
+      if (leftover &gt; 0) blocks.push_back({addr + n, leftover, true});
+      return makePtr(addr);
+    }
+  }
+  // No block large enough: grow
+  size_t oldCap = heap.size();
+  heap.resize(oldCap + n);
+  blocks.push_back({oldCap, n, false});
+  return makePtr(oldCap);
+}
+
+
+static inline Value freeFn(const std::vector&lt;Value&gt;& args) {
+  uintptr_t addr = args[0].addr;
+
+  // Find block and mark free
+  for (auto &b : blocks) {
+    if (b.start == addr) { b.free = true; break; }
+  }
+  // Coalescing adjacent free blocks
+  std::sort(blocks.begin(), blocks.end(), [](auto &a, auto &b){ return a.start &lt; b.start; });
+  for (size_t i = 0; i + 1 &lt; blocks.size(); ) {
+    auto &cur = blocks[i], &nxt = blocks[i+1];
+    if (cur.free && nxt.free) {
+      cur.size += nxt.size;
+      blocks.erase(blocks.begin() + (i+1));
+    } else {
+      ++i;
+    }
+  }
+  return Value(); // void
+}
+
+static inline Value load8Fn(const std::vector&lt;Value&gt;& args) {
+  size_t idx = args[0].addr + static_cast&lt;size_t&gt;(args[1].num);
+  return Value(static_cast&lt;double&gt;(heap[idx]));
+}
+static inline Value store8Fn(const std::vector&lt;Value&gt;& args) {
+  size_t idx = args[0].addr + static_cast&lt;size_t&gt;(args[1].num);
+  heap[idx] = static_cast&lt;uint8_t&gt;(args[2].num);
+  return Value();
+}
+static inline Value load32Fn(const std::vector&lt;Value&gt;& args) {
+  size_t idx = args[0].addr + static_cast&lt;size_t&gt;(args[1].num);
+  int32_t v = 0;
+  for (int i = 0; i &lt; 4; ++i) v |= heap[idx + i] &lt;&lt; (8 * i);
+  return Value(static_cast&lt;double&gt;(v));
+}
+static inline Value store32Fn(const std::vector&lt;Value&gt;& args) {
+  size_t idx = args[0].addr + static_cast&lt;size_t&gt;(args[1].num);
+  int32_t v = static_cast&lt;int32_t&gt;(args[2].num);
+  for (int i = 0; i &lt; 4; ++i) heap[idx + i] = (v &gt;&gt; (8 * i)) & 0xFF;
+  return Value();
+}
+
+static inline void printValue(const Value& v) {
+    switch (v.kind) {
+        case Value::NUM:
+            if (v.num == (int64_t)v.num) // whole number?
+                std::cout &lt;&lt; (int64_t)v.num;
+            else
+                std::cout &lt;&lt; v.num;
+            break;
+        case Value::STR:
+            std::cout &lt;&lt; v.str;
+            break;
+        case Value::ARR:
+            std::cout &lt;&lt; "[";
+            for (size_t i = 0; i &lt; v.arr.size(); ++i) {
+                if (i &gt; 0) std::cout &lt;&lt; ", ";
+                printValue(v.arr[i]);
+            }
+            std::cout &lt;&lt; "]";
+            break;
+        case Value::STRUCT:
+            std::cout &lt;&lt; "{";
+            for (auto it = v.fields.begin(); it != v.fields.end(); ++it) {
+                if (it != v.fields.begin()) std::cout &lt;&lt; ", ";
+                std::cout &lt;&lt; it-&gt;first &lt;&lt; ": ";
+                printValue(it-&gt;second);
+            }
+            std::cout &lt;&lt; "}";
+            break;
+        case Value::TAILCALL:
+            std::cout &lt;&lt; "&lt;tailcall&gt;";
+            break;
+        case Value::NONE:
+            std::cout &lt;&lt; "null";
+            break;
+
+        case Value::PTR:
+            std::cout &lt;&lt; "0x" &lt;&lt; std::hex &lt;&lt; v.addr &lt;&lt; std::dec;
+            break;
+    }
+}
+
+static inline Value printFn(const std::vector&lt;Value&gt;& args) {
+    std::cout &lt;&lt; "\033[33m";
+    for (size_t i = 0; i &lt; args.size(); ++i) {
+        if (i) std::cout &lt;&lt; " ";
+        printValue(args[i]);
+    }
+    std::cout &lt;&lt; "\033[0m\n";
+    return Value();
+}
+
+static inline Value systemFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::STR) {
+        std::cerr &lt;&lt; "system() requires a string argument\n";
+        return Value(0);
+    }
+
+    int result = std::system(args[0].str.c_str());
+    return Value(result);  // Return exit code
+}
+
+static inline Value exitFn(const std::vector&lt;Value&gt;& args) {
+    int code = 0;
+    if (!args.empty() && args[0].kind == Value::NUM) {
+        code = static_cast&lt;int&gt;(args[0].num);
+    }
+    std::exit(code);  // doesn't return
+}
+
+static inline Value readfileFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::STR) {
+        std::cerr &lt;&lt; "readfile() requires a string path\n";
+        return Value(0);
+    }
+    std::ifstream in(args[0].str);
+    if (!in) {
+        std::cerr &lt;&lt; "Failed to open file: " &lt;&lt; args[0].str &lt;&lt; "\n";
+        return Value(0);
+    }
+
+    std::string content((std::istreambuf_iterator&lt;char&gt;(in)),
+                         std::istreambuf_iterator&lt;char&gt;());
+    return Value(content);
+}
+
+static inline Value writefileFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 2 || args[0].kind != Value::STR || args[1].kind != Value::STR) {
+        std::cerr &lt;&lt; "writefile() needs a path and content (both strings)\n";
+        return Value(0);
+    }
+    std::ofstream out(args[0].str);
+    if (!out) {
+        std::cerr &lt;&lt; "Could not open file for writing\n";
+        return Value(0);
+    }
+
+    out &lt;&lt; args[1].str;
+    return Value(); // void return
+}
+
+static inline Value sleepFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::NUM) {
+        std::cerr &lt;&lt; "sleep() needs a number (seconds)\n";
+        return Value(0);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast&lt;int&gt;(args[0].num * 1000)));
+    return Value();
+}
+
+static inline Value envFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::STR) {
+        std::cerr &lt;&lt; "env() needs a string variable name\n";
+        return Value(0);
+    }
+    const char* val = std::getenv(args[0].str.c_str());
+    return val ? Value(std::string(val)) : Value("");
+}
+
+static inline Value randFn(const std::vector&lt;Value&gt;&) {
+    return Value(static_cast&lt;double&gt;(std::rand()) / RAND_MAX);
+}
+
+static inline Value typeFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty()) return Value("none");
+    const Value& v = args[0];
+    switch (v.kind) {
+        case Value::NUM: return Value("num");
+        case Value::STR: return Value("str");
+        case Value::ARR: return Value("arr");
+        case Value::STRUCT: return Value("struct");
+        default: return Value("unknown");
+    }
+}
+
+static inline Value toUpperFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::STR) 
+        return Value("");  // Or handle error
+
+    std::string s = args[0].str;
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return std::toupper(c); });
+    return Value(std::move(s));
+}
+
+static inline Value toLowerFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::STR) 
+        return Value("");
+
+    std::string s = args[0].str;
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return Value(std::move(s));
+}
+
+static inline Value trimFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::STR) 
+        return Value("");
+
+    const std::string& s = args[0].str;
+    size_t start = 0;
+    while (start &lt; s.size() && std::isspace(static_cast&lt;unsigned char&gt;(s[start])))
+        ++start;
+
+    size_t end = s.size();
+    while (end &gt; start && std::isspace(static_cast&lt;unsigned char&gt;(s[end - 1])))
+        --end;
+
+    return Value(s.substr(start, end - start));
+}
+
+static inline Value splitFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::STR)
+        return Value(std::vector&lt;Value&gt;{});
+
+    const std::string& s = args[0].str;
+    std::string delimiter = ",";
+    if (args.size() &gt; 1 && args[1].kind == Value::STR)
+        delimiter = args[1].str;
+
+    std::vector&lt;Value&gt; parts;
+    size_t pos = 0, next;
+    while ((next = s.find(delimiter, pos)) != std::string::npos) {
+        parts.emplace_back(Value(s.substr(pos, next - pos)));
+        pos = next + delimiter.length();
+    }
+    parts.emplace_back(Value(s.substr(pos)));
+
+    return Value(parts);
+}
+
+static inline Value replaceFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 3 || args[0].kind != Value::STR || args[1].kind != Value::STR || args[2].kind != Value::STR)
+        return Value("");
+
+    std::string s = args[0].str;
+    const std::string& from = args[1].str;
+    const std::string& to = args[2].str;
+
+    if (from.empty()) // avoid infinite loop
+        return Value(s);
+
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.length(), to);
+        pos += to.length();
+    }
+
+    return Value(std::move(s));
+}
+
+static inline Value formatFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::STR)
+        return Value("");
+
+    std::string fmt = args[0].str;
+
+    // Regex to find placeholders like {0}, {1}, ...
+    std::regex re("\\{(\\d+)\\}");
+
+    auto it = std::sregex_iterator(fmt.begin(), fmt.end(), re);
+    auto end = std::sregex_iterator();
+
+    std::string result;
+    size_t lastPos = 0;
+
+    for (; it != end; ++it) {
+        std::smatch match = *it;
+        int index = std::stoi(match[1].str());
+
+        // Append part before the placeholder
+        result += fmt.substr(lastPos, match.position() - lastPos);
+
+        // Append argument or empty string if out of range
+        if ((size_t)index + 1 &lt; args.size()) {
+            const Value& val = args[index + 1];
+            if (val.kind == Value::STR)
+                result += val.str;
+            else if (val.kind == Value::NUM)
+                result += std::to_string(val.num);
+            else
+                result += ""; // or handle other types differently
+        } else {
+            result += ""; // no argument supplied
+        }
+
+        lastPos = match.position() + match.length();
+    }
+
+    // Append remaining part of the string
+    result += fmt.substr(lastPos);
+
+    return Value(std::move(result));
+}
+
+static inline Value startsWithFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 2 || args[0].kind != Value::STR || args[1].kind != Value::STR)
+        return Value(0.0);
+
+    const std::string& s = args[0].str;
+    const std::string& prefix = args[1].str;
+
+    bool starts = s.compare(0, prefix.size(), prefix) == 0;
+    return Value(starts ? 1.0 : 0.0);
+}
+
+static inline Value endsWithFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 2 || args[0].kind != Value::STR || args[1].kind != Value::STR)
+        return Value(0.0);
+
+    const std::string& s = args[0].str;
+    const std::string& suffix = args[1].str;
+
+    if (suffix.size() &gt; s.size())
+        return Value(0.0);
+
+    bool ends = s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    return Value(ends ? 1.0 : 0.0);
+}
+
+static inline Value isDigitFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::STR)
+        return Value(0.0);
+
+    const std::string& s = args[0].str;
+    bool allDigits = !s.empty() && std::all_of(s.begin(), s.end(),
+                        [](unsigned char c) { return std::isdigit(c); });
+
+    return Value(allDigits ? 1.0 : 0.0);
+}
+
+static inline Value inputFn(const std::vector&lt;Value&gt;& args) {
+    // Map of color names to ANSI codes
+    static const std::unordered_map&lt;std::string, std::string&gt; colors = {
+        {"black",   "\033[30m"},
+        {"red",     "\033[31m"},
+        {"green",   "\033[32m"},
+        {"yellow",  "\033[33m"},
+        {"blue",    "\033[34m"},
+        {"magenta", "\033[35m"},
+        {"cyan",    "\033[36m"},
+        {"white",   "\033[37m"},
+        {"reset",   "\033[0m"}
+    };
+
+    std::string colorCode = "\033[36m"; // default cyan
+    size_t promptArgCount = args.size();
+
+    if (args.size() &gt;= 2 && args.back().kind == Value::STR) {
+        // Check if last arg is a color string
+        auto it = colors.find(args.back().str);
+        if (it != colors.end()) {
+            colorCode = it-&gt;second;
+            promptArgCount = args.size() - 1; // exclude last arg from prompt
+        }
+    }
+
+    if (promptArgCount &gt; 0) {
+        std::cout &lt;&lt; colorCode;
+        for (size_t i = 0; i &lt; promptArgCount; ++i) {
+            if (i) std::cout &lt;&lt; " ";
+            printValue(args[i]);
+        }
+        std::cout &lt;&lt; "\033[0m "; // reset color + trailing space
+        std::cout.flush();
+    }
+
+    std::string input;
+    std::getline(std::cin, input);
+
+    return Value(input);
+}
+
+static inline Value sliceFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::STR)
+        return Value("");
+
+    const std::string& s = args[0].str;
+    int len = static_cast&lt;int&gt;(s.size());
+
+    // Default slice indices
+    int start = 0;
+    int end = len;
+
+    // Helper lambda to convert Value to int index with negative support
+    auto toIndex = [&](size_t argIdx) -&gt; int {
+        if (args.size() &gt; argIdx && args[argIdx].kind == Value::NUM) {
+            int idx = static_cast&lt;int&gt;(args[argIdx].num);
+            // Support negative indexing
+            if (idx &lt; 0) idx += len;
+            if (idx &lt; 0) idx = 0;
+            if (idx &gt; len) idx = len;
+            return idx;
+        }
+        return -1; // invalid
+    };
+
+    int sIndex = toIndex(1);
+    if (sIndex != -1) start = sIndex;
+
+    int eIndex = toIndex(2);
+    if (eIndex != -1) end = eIndex;
+
+    // Clamp indices
+    if (start &gt; end) return Value("");
+
+    if (start &lt; 0) start = 0;
+    if (end &gt; len) end = len;
+
+    return Value(s.substr(start, end - start));
+}
+
+static inline Value sysclFn(const std::vector&lt;Value&gt;&) {
+#ifdef _WIN32
+    system("cls");
+#else
+    system("clear");
+#endif
+    return Value(0);
+}
+
+
+static inline Value cintFn(const std::vector&lt;Value&gt;& args) {
+    // Must be exactly one string argument
+    if (args.size() != 1 || args[0].kind != Value::STR) {
+        std::cerr &lt;&lt; "cint: expected a single string argument\n";
+        return Value(0);
+    }
+    const std::string &s = args[0].str;
+    long long result = 0;
+
+    auto first = s.data();
+    auto last  = s.data() + s.size();
+    auto [ptr, ec] = std::from_chars(first, last, result);
+
+    if (ec == std::errc()) {
+        // success, but ensure we consumed the entire string
+        if (ptr == last) {
+            return Value(static_cast&lt;double&gt;(result));
+        }
+        // leftover characters → invalid
+        std::cerr &lt;&lt; "cint: invalid trailing characters in '" &lt;&lt; s &lt;&lt; "'\n";
+    } else if (ec == std::errc::invalid_argument) {
+        std::cerr &lt;&lt; "cint: no conversion could be performed for '" &lt;&lt; s &lt;&lt; "'\n";
+    } else if (ec == std::errc::result_out_of_range) {
+        std::cerr &lt;&lt; "cint: value out of range in '" &lt;&lt; s &lt;&lt; "'\n";
+    }
+    return Value(0);
+}
+
+static inline Value cstrFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::NUM) {
+        std::cerr &lt;&lt; "cstr: expected a single numeric argument\n";
+        return Value("");
+    }
+
+    char buf[32];  // More than enough for any double
+    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), args[0].num);
+    if (ec == std::errc()) {
+        return Value(std::string(buf, ptr));
+    } else {
+        std::cerr &lt;&lt; "cstr: conversion error\n";
+        return Value("");
+    }
+}
+
+static inline Value roundFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::NUM) {
+        std::cerr &lt;&lt; "round: expected a single numeric argument\n";
+        return Value(0);
+    }
+    double rounded = std::round(args[0].num);
+    return Value(rounded);
+}
+
+static inline Value floorFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::NUM) {
+        std::cerr &lt;&lt; "floor: expected a single numeric argument\n";
+        return Value(0);
+    }
+    return Value(std::floor(args[0].num));
+}
+
+static inline Value ceilFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::NUM) {
+        std::cerr &lt;&lt; "ceil: expected a single numeric argument\n";
+        return Value(0);
+    }
+    return Value(std::ceil(args[0].num));
+}
+
+static inline Value absFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::NUM) {
+        std::cerr &lt;&lt; "abs: expected a single numeric argument\n";
+        return Value(0);
+    }
+    return Value(std::fabs(args[0].num));
+}
+
+static inline Value sqrtFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::NUM) {
+        std::cerr &lt;&lt; "sqrt: expected a single numeric argument\n";
+        return Value(0);
+    }
+    return Value(std::sqrt(args[0].num));
+}
+
+static inline Value slenFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::STR) {
+        std::cerr &lt;&lt; "length: expected one string argument\n";
+        return Value(0);
+    }
+    return Value(static_cast&lt;double&gt;(args[0].str.size()));
+}
+
+static inline Value containsFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 2 || args[0].kind != Value::STR || args[1].kind != Value::STR) {
+        std::cerr &lt;&lt; "contains: expected two string arguments\n";
+        return Value(0);
+    }
+    const auto& s = args[0].str;
+    const auto& sub = args[1].str;
+    return Value(s.find(sub) != std::string::npos ? 1.0 : 0.0);
+}
+
+static inline Value charAtFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 2 || args[0].kind != Value::STR || args[1].kind != Value::NUM) {
+        std::cerr &lt;&lt; "charAt: expected (string, number)\n";
+        return Value("");
+    }
+    const auto& s = args[0].str;
+    int index = static_cast&lt;int&gt;(args[1].num);
+    if (index &lt; 0 || index &gt;= (int)s.size()) return Value("");
+    return Value(std::string(1, s[index]));
+}
+
+static inline Value sinFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::NUM) {
+        std::cerr &lt;&lt; "sin: expected a single numeric argument\n";
+        return Value(0);
+    }
+    
+    double x = args[0].num;
+
+    // Fast sine approximation (range reduction and polynomial)
+    const double PI = 3.14159265358979323846;
+    const double TWO_PI = 2.0 * PI;
+    
+    // Range reduction to [-pi, pi]
+    while (x &lt; -PI) x += TWO_PI;
+    while (x &gt; PI) x -= TWO_PI;
+    
+    double x2 = x * x;
+    double result = x * (1.0 - x2 / 6.0 + x2 * x2 / 120.0);
+
+    return Value(result);
+}
+
+// ——— Array Function Enhancements ————————————————————————————————
+static inline Value aliceFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 2 || args.size() &gt; 3 || args[0].kind != Value::ARR) {
+        std::cerr &lt;&lt; "slice: expects (array, start, [end])\n";
+        return Value();
+    }
+    
+    const auto& arr = args[0].arr;
+    int size = static_cast&lt;int&gt;(arr.size());
+    int start = static_cast&lt;int&gt;(args[1].num);
+    int end = args.size() &gt; 2 ? static_cast&lt;int&gt;(args[2].num) : size;
+
+    // Handle negative indices
+    start = start &lt; 0 ? std::max(size + start, 0) : std::min(start, size);
+    end = end &lt; 0 ? std::max(size + end, 0) : std::min(end, size);
+
+    if (start &gt;= end) return Value(std::vector&lt;Value&gt;{});
+
+    std::vector&lt;Value&gt; result;
+    result.reserve(end - start);
+    for (int i = start; i &lt; end; ++i) {
+        result.push_back(arr[i]);
+    }
+    return Value(std::move(result));
+}
+
+static inline Value joinFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 2 || args[0].kind != Value::ARR || args[1].kind != Value::STR) {
+        std::cerr &lt;&lt; "join: expects (array, separator)\n";
+        return Value("");
+    }
+
+    std::stringstream ss;
+    const auto& arr = args[0].arr;
+    const std::string& sep = args[1].str;
+    
+    for (size_t i = 0; i &lt; arr.size(); ++i) {
+        if (i &gt; 0) ss &lt;&lt; sep;
+        if (arr[i].kind == Value::STR) ss &lt;&lt; arr[i].str;
+        else if (arr[i].kind == Value::NUM) ss &lt;&lt; arr[i].num;
+        else ss &lt;&lt; "[array]";
+    }
+    return Value(ss.str());
+}
+
+static inline Value reverseFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::ARR) {
+        std::cerr &lt;&lt; "reverse: expects array argument\n";
+        return Value();
+    }
+
+    auto arr = args[0].arr;
+    std::reverse(arr.begin(), arr.end());
+    return Value(std::move(arr));
+}
+
+static inline Value popFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::ARR) {
+        std::cerr &lt;&lt; "pop: expects array argument\n";
+        return Value();
+    }
+
+    auto arr = args[0].arr;
+    if (arr.empty()) return Value();
+    Value last = arr.back();
+    arr.pop_back();
+    return Value(arr);  // Return new array without last element
+}
+
+static inline Value pushFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 2 || args[0].kind != Value::ARR) {
+        std::cerr &lt;&lt; "push: expects (array, value)\n";
+        return Value();
+    }
+
+    auto arr = args[0].arr;
+    arr.push_back(args[1]);
+    return Value(std::move(arr));  // Return new array
+}
+
+static inline Value removeAtFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 2 || args[0].kind != Value::ARR || args[1].kind != Value::NUM) {
+        std::cerr &lt;&lt; "removeAt: expects (array, index)\n";
+        return Value();
+    }
+
+    auto arr = args[0].arr;
+    int index = static_cast&lt;int&gt;(args[1].num);
+    
+    if (index &lt; 0 || index &gt;= static_cast&lt;int&gt;(arr.size())) {
+        std::cerr &lt;&lt; "removeAt: index out of range\n";
+        return Value(arr);  // Return original array
+    }
+
+    arr.erase(arr.begin() + index);
+    return Value(std::move(arr));  // Return new array
+}
+
+
+static inline Value allocFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() != 1 || args[0].kind != Value::NUM) {
+        std::cerr &lt;&lt; "alloc: expected a number\n";
+        return Value();
+    }
+    int n = static_cast&lt;int&gt;(args[0].num);
+    std::vector&lt;Value&gt; memory(n, Value(0.0));  // zeroed array
+    return Value(std::move(memory));
+}
+
+static LRESULT CALLBACK DummyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_SIZE: {
+        int width = LOWORD(lParam);
+        int height = HIWORD(lParam);
+        if (height == 0) height = 1;
+
+        // Update OpenGL viewport and projection
+        glViewport(0, 0, width, height);
+
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(-1, 1, -1, 1, -1, 1); // Keep coordinate system simple
+
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+
+        return 0;
+    }
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    case WM_PAINT: {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBegin(GL_TRIANGLES);
+    glColor3f(1.0f, 0.0f, 0.0f); glVertex3f(-0.5f, -0.5f, 0.0f);
+    glColor3f(0.0f, 1.0f, 0.0f); glVertex3f( 0.5f, -0.5f, 0.0f);
+    glColor3f(0.0f, 0.0f, 1.0f); glVertex3f( 0.0f,  0.5f, 0.0f);
+    glEnd();
+
+    SwapBuffers(GetDC(hwnd));
+
+    EndPaint(hwnd, &ps);
+    return 0;
+}
+
+    default:
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+}
+
+static inline Value winCreateWindowFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 3 || args[0].kind != Value::STR || args[1].kind != Value::NUM || args[2].kind != Value::NUM)
+        return Value(0);
+    
+    const char* className = "MyWinClass";
+    const char* windowTitle = args[0].str.c_str();
+    int width = static_cast&lt;int&gt;(args[1].num);
+    int height = static_cast&lt;int&gt;(args[2].num);
+
+    static bool registered = false;
+    static WNDCLASSA wc;
+
+    if (!registered) {
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = DummyWndProc;
+        wc.cbClsExtra = 0;
+        wc.cbWndExtra = 0;
+        wc.hInstance = GetModuleHandle(NULL);
+        wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszMenuName = NULL;
+        wc.lpszClassName = className;
+        RegisterClassA(&wc);
+        registered = true;
+    }
+
+    HWND hwnd = CreateWindowA(className, windowTitle, WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                              CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+                              NULL, NULL, GetModuleHandle(NULL), NULL);
+    return Value(static_cast&lt;double&gt;(reinterpret_cast&lt;uintptr_t&gt;(hwnd)));
+}
+
+static inline Value winMessageLoopFn(const std::vector&lt;Value&gt;& args) {
+    MSG msg;
+    BOOL ret;
+    while ((ret = GetMessage(&msg, NULL, 0, 0)) != 0) {
+        if (ret == -1) {
+            // error in GetMessage
+            return Value(0);
+        } else {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+    return Value(static_cast&lt;double&gt;(msg.wParam));
+}
+
+static inline Value winGetDCFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::NUM) return Value(0);
+    HWND hwnd = reinterpret_cast&lt;HWND&gt;(static_cast&lt;uintptr_t&gt;(args[0].num));
+    HDC hdc = GetDC(hwnd);
+    return Value(static_cast&lt;double&gt;(reinterpret_cast&lt;uintptr_t&gt;(hdc)));
+}
+
+static inline Value winReleaseDCFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 2 || args[0].kind != Value::NUM || args[1].kind != Value::NUM) return Value(0);
+    HWND hwnd = reinterpret_cast&lt;HWND&gt;(static_cast&lt;uintptr_t&gt;(args[0].num));
+    HDC hdc = reinterpret_cast&lt;HDC&gt;(static_cast&lt;uintptr_t&gt;(args[1].num));
+    int result = ReleaseDC(hwnd, hdc);
+    return Value(static_cast&lt;double&gt;(result));
+}
+
+static inline Value winDrawTextFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 4 || args[0].kind != Value::NUM || args[1].kind != Value::NUM ||
+        args[2].kind != Value::NUM || args[3].kind != Value::STR)
+        return Value(0);
+
+    HDC hdc = reinterpret_cast&lt;HDC&gt;(static_cast&lt;uintptr_t&gt;(args[0].num));
+    int x = static_cast&lt;int&gt;(args[1].num);
+    int y = static_cast&lt;int&gt;(args[2].num);
+    const char* text = args[3].str.c_str();
+
+    int result = TextOutA(hdc, x, y, text, (int)strlen(text));
+    return Value(result != 0 ? 1.0 : 0.0);
+}
+
+static inline Value winDrawRectangleFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 5) return Value(0);
+    if (args[0].kind != Value::NUM || args[1].kind != Value::NUM || args[2].kind != Value::NUM ||
+        args[3].kind != Value::NUM || args[4].kind != Value::NUM) return Value(0);
+
+    HDC hdc = reinterpret_cast&lt;HDC&gt;(static_cast&lt;uintptr_t&gt;(args[0].num));
+    int x = static_cast&lt;int&gt;(args[1].num);
+    int y = static_cast&lt;int&gt;(args[2].num);
+    int w = static_cast&lt;int&gt;(args[3].num);
+    int h = static_cast&lt;int&gt;(args[4].num);
+
+    BOOL result = Rectangle(hdc, x, y, x + w, y + h);
+    return Value(result ? 1.0 : 0.0);
+}
+
+static inline Value winFillRectFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 8) return Value(0);
+    if (args[0].kind != Value::NUM || args[1].kind != Value::NUM || args[2].kind != Value::NUM ||
+        args[3].kind != Value::NUM || args[4].kind != Value::NUM || args[5].kind != Value::NUM ||
+        args[6].kind != Value::NUM || args[7].kind != Value::NUM)
+        return Value(0);
+
+    HDC hdc = reinterpret_cast&lt;HDC&gt;(static_cast&lt;uintptr_t&gt;(args[0].num));
+    int x = static_cast&lt;int&gt;(args[1].num);
+    int y = static_cast&lt;int&gt;(args[2].num);
+    int w = static_cast&lt;int&gt;(args[3].num);
+    int h = static_cast&lt;int&gt;(args[4].num);
+    COLORREF color = RGB(
+        (BYTE)args[5].num,
+        (BYTE)args[6].num,
+        (BYTE)args[7].num
+    );
+
+    HBRUSH brush = CreateSolidBrush(color);
+    RECT rect = { x, y, x + w, y + h };
+    BOOL result = FillRect(hdc, &rect, brush);
+    DeleteObject(brush);
+    return Value(result ? 1.0 : 0.0);
+}
+
+static HGLRC createOpenGLContext(HWND hwnd) {
+    HDC hdc = GetDC(hwnd);
+
+    PIXELFORMATDESCRIPTOR pfd = { sizeof(PIXELFORMATDESCRIPTOR) };
+    pfd.nVersion = 1;
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    pfd.iPixelType = PFD_TYPE_RGBA;
+    pfd.cColorBits = 32;
+    pfd.cDepthBits = 24;
+    pfd.iLayerType = PFD_MAIN_PLANE;
+
+    int pixelFormat = ChoosePixelFormat(hdc, &pfd);
+    if (pixelFormat == 0) return NULL;
+    if (!SetPixelFormat(hdc, pixelFormat, &pfd)) return NULL;
+
+    HGLRC hglrc = wglCreateContext(hdc);
+    if (!hglrc) return NULL;
+
+    if (!wglMakeCurrent(hdc, hglrc)) {
+        wglDeleteContext(hglrc);
+        return NULL;
+    }
+    return hglrc;
+}
+
+static inline Value winCreateGLContextFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 1 || args[0].kind != Value::NUM) return Value(0);
+    HWND hwnd = reinterpret_cast&lt;HWND&gt;(static_cast&lt;uintptr_t&gt;(args[0].num));
+
+    HGLRC hglrc = createOpenGLContext(hwnd);
+    return Value(static_cast&lt;double&gt;(reinterpret_cast&lt;uintptr_t&gt;(hglrc)));
+}
+
+static inline Value winSwapBuffersFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 1 || args[0].kind != Value::NUM) return Value(0);
+    HWND hwnd = reinterpret_cast&lt;HWND&gt;(static_cast&lt;uintptr_t&gt;(args[0].num));
+    HDC hdc = GetDC(hwnd);
+    BOOL res = SwapBuffers(hdc);
+    ReleaseDC(hwnd, hdc);
+    return Value(res ? 1.0 : 0.0);
+}
+
+static inline Value winClearScreenFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 4) return Value(0);
+    float r = static_cast&lt;float&gt;(args[0].num);
+    float g = static_cast&lt;float&gt;(args[1].num);
+    float b = static_cast&lt;float&gt;(args[2].num);
+    float a = static_cast&lt;float&gt;(args[3].num);
+
+    glClearColor(r, g, b, a);
+    glClear(GL_COLOR_BUFFER_BIT);
+    return Value(1.0);
+}
+
+static inline Value glBeginFn(const std::vector&lt;Value&gt;& args) {
+    if (args.empty() || args[0].kind != Value::NUM) return Value(0);
+    glBegin(static_cast&lt;GLenum&gt;(args[0].num));
+    return Value(1.0);
+}
+
+static inline Value glEndFn(const std::vector&lt;Value&gt;& args) {
+    glEnd();
+    return Value(1.0);
+}
+
+static inline Value glVertex3fFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 3) return Value(0);
+    glVertex3f((float)args[0].num, (float)args[1].num, (float)args[2].num);
+    return Value(1.0);
+}
+
+static inline Value glColor3fFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 3) return Value(0);
+    glColor3f((float)args[0].num, (float)args[1].num, (float)args[2].num);
+    return Value(1.0);
+}
+
+static inline Value winResizeViewportFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 2) return Value(0);
+    int width = (int)args[0].num;
+    int height = (int)args[1].num;
+    if (height == 0) height = 1; // prevent divide by zero
+
+    glViewport(0, 0, width, height);
+
+    // Optional: Reset projection matrix for orthographic 2D
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(-1, 1, -1, 1, -1, 1); // simple orthographic projection
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    return Value(1.0);
+}
+
+static inline Value glTranslatefFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 3) return Value(0);
+    glTranslatef((float)args[0].num, (float)args[1].num, (float)args[2].num);
+    return Value(1.0);
+}
+
+static inline Value glRotatefFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 4) return Value(0);
+    glRotatef((float)args[0].num, (float)args[1].num, (float)args[2].num, (float)args[3].num);
+    return Value(1.0);
+}
+
+
+static inline Value glScalefFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 3) return Value(0);
+    glScalef((float)args[0].num, (float)args[1].num, (float)args[2].num);
+    return Value(1.0);
+}
+
+static inline Value glOrthoFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 6) return Value(0);
+    glOrtho(
+        (float)args[0].num, (float)args[1].num,
+        (float)args[2].num, (float)args[3].num,
+        (float)args[4].num, (float)args[5].num
+    );
+    return Value(1.0);
+}
+
+static inline Value glFrustumFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 6) return Value(0);
+    glFrustum(
+        (float)args[0].num, (float)args[1].num,
+        (float)args[2].num, (float)args[3].num,
+        (float)args[4].num, (float)args[5].num
+    );
+    return Value(1.0);
+}
+
+static inline Value glPushMatrixFn(const std::vector&lt;Value&gt;& args) {
+    glPushMatrix();
+    return Value(1.0);
+}
+
+static inline Value glPopMatrixFn(const std::vector&lt;Value&gt;& args) {
+    glPopMatrix();
+    return Value(1.0);
+}
+
+static inline Value winPollEventsFn(const std::vector&lt;Value&gt;& args) {
+    MSG msg;
+    // Process all pending messages
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            return Value(1.0);  // signal “quit”
+        }
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    return Value(0.0);
+}
+
+static inline Value glDisableFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 1) return Value(0);
+    glDisable((GLenum)args[0].num);
+    return Value(1.0);
+}
+
+static inline Value glLineWidthFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 1) return Value(0);
+    glLineWidth((GLfloat)args[0].num);
+    return Value(1.0);
+}
+
+static inline Value glEnableFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 1) return Value(0);
+    glEnable((GLenum)args[0].num);
+    return Value(1.0);
+}
+
+static inline Value glLoadIdentityFn(const std::vector&lt;Value&gt;& args) {
+    glLoadIdentity();
+    return Value(1.0);
+}
+
+static inline Value glMatrixModeFn(const std::vector&lt;Value&gt;& args) {
+    if (args.size() &lt; 1) return Value(0);
+    glMatrixMode((GLenum)args[0].num);
+    return Value(1.0);
+}
+
+
+// ——— Token Types —————————————————————————————————————————————————
+enum class TTokenType {
+    EOF_T, Number, Identifier,
+    Plus, Minus, Star, Slash, Mod,
+    Greater, Less, GreaterEq, LessEq, EqEq, NotEq,
+    LParen, RParen, LBrace, RBrace,
+    Assign, Semicolon, Comma, Colon,
+    IntKw, StringLit,
+    IfKw, ElifKw,  ElseKw, WhileKw, ForKw, SwitchKw, CaseKw, DefaultKw, BreakKw,
+    ImportKw,
+    Increment, Decrement, PowerSelf, Dtune, ModSelf,
+    ReturnKw,
+    LBracket, RBracket,
+    PlusAssign, MinusAssign,
+    StructKw, Dot, 
+    And, XOR, LShift, LAND, RShift, OR, DTurnStile,
+    QMARK, Arrow,
+    PtrKw, ALACP, ArrKw, StringKw
+};
+
+struct Token {
+    TTokenType type;
+    std::string text;
+};
+
+struct FunctionDef {
+    std::string returnType;
+    std::vector&lt;std::string&gt; params;
+    std::vector&lt;Token&gt; bodyTokens;
+};
+
+// ——— Lexer ————————————————————————————————————————————————————————
+class Lexer {
+    const std::string &s;
+    size_t pos = 0;
+public:
+    Lexer(const std::string &inp): s(inp) {}
+    Token next() {
+        while (pos&lt;s.size() && isspace(s[pos])) ++pos;
+        if (pos&gt;=s.size()) return {TTokenType::EOF_T, ""};
+        char c = s[pos];
+        // two‑char ops
+        if (c=='=' && pos+1&lt;s.size() && s[pos+1]=='=') { pos+=2; return {TTokenType::EqEq,"=="}; }
+        if (c=='!' && pos+1&lt;s.size() && s[pos+1]=='=') { pos+=2; return {TTokenType::NotEq,"!="}; }
+        if (c=='&gt;' && pos+1&lt;s.size() && s[pos+1]=='=') { pos+=2; return {TTokenType::GreaterEq,"&gt;="}; }
+        if (c=='&lt;' && pos+1&lt;s.size() && s[pos+1]=='=') { pos+=2; return {TTokenType::LessEq,"&lt;="}; }
+        if (c=='+' && pos+1&lt;s.size() && s[pos+1]=='+') {
+            pos += 2;
+            return {TTokenType::Increment, "++"};
+        }
+        if (c=='-' && pos+1&lt;s.size() && s[pos+1]=='-') {
+            pos += 2;
+            return {TTokenType::Decrement, "--"};
+        }
+        if (c=='-' && pos+1&lt;s.size() && s[pos+1]=='=') {
+            pos += 2;
+            return {TTokenType::MinusAssign, "-="};
+        }
+        if (c=='*' && pos+1&lt;s.size() && s[pos+1]=='*') {
+          pos += 2;
+          return {TTokenType::PowerSelf, "**"};
+        }
+
+        if (c == '+' && pos + 1 &lt; s.size() && s[pos + 1] == '=') {
+          pos += 2;
+          return {TTokenType::PlusAssign, "+="};
+        }
+
+        // Single-line comment: skip everything after '//'
+        if (c == '/' && pos + 1 &lt; s.size() && s[pos + 1] == '/') {
+            pos += 2;
+            while (pos &lt; s.size() && s[pos] != '\n') ++pos;
+            return next();
+        }
+
+
+        if (c == '%' && pos + 1 &lt; s.size() && s[pos + 1] == '%') {
+          pos += 2;
+          return {TTokenType::ModSelf, "%%"};
+        }
+
+        if (c == '&lt;' && pos + 1 &lt; s.size() && s[pos + 1] == '&lt;') {
+            pos += 2;
+            return {TTokenType::LShift, "&lt;&lt;"};
+        }
+
+        if (c == '&' && pos + 1 &lt; s.size() && s[pos + 1] == '&') {
+            pos += 2;
+            return {TTokenType::LAND, "&&"};
+        }
+
+        if (c == '&gt;' && pos + 1 &lt; s.size() && s[pos + 1] == '&gt;') {
+            pos += 2;
+            return {TTokenType::RShift, "&gt;&gt;"};
+        }
+
+        if (c == '|' && pos + 1 &lt; s.size() && s[pos + 1] == '=') {
+            pos += 2;
+            return {TTokenType::DTurnStile, "|="};
+        }
+
+        if (c == '-' && pos + 1 &lt; s.size() && s[pos + 1] == '&gt;') {
+            pos += 2;
+            return {TTokenType::Arrow, "-&gt;"};
+        }
+
+        if (c == ':' && pos + 1 &lt; s.size() && s[pos + 1] == ':') {
+            pos += 2;
+            return {TTokenType::ALACP, "::"};
+        }
+
+        // single‑char
+        switch(c) {
+          case '&gt;': ++pos; return {TTokenType::Greater, "&gt;"};
+          case '&lt;': ++pos; return {TTokenType::Less,    "&lt;"};
+          case '+': ++pos; return {TTokenType::Plus,    "+"};
+          case '-': ++pos; return {TTokenType::Minus,   "-"};
+          case '*': ++pos; return {TTokenType::Star,    "*"};
+          case '/': ++pos; return {TTokenType::Slash,   "/"};
+          case '%': ++pos; return {TTokenType::Mod,     "%"};
+          case '(': ++pos; return {TTokenType::LParen,  "("};
+          case ')': ++pos; return {TTokenType::RParen,  ")"};
+          case '{': ++pos; return {TTokenType::LBrace,  "{"};
+          case '}': ++pos; return {TTokenType::RBrace,  "}"};
+          case '=': ++pos; return {TTokenType::Assign,  "="};
+          case ';': ++pos; return {TTokenType::Semicolon,";"};
+          case ',': ++pos; return {TTokenType::Comma,   ","};
+          case ':': ++pos; return {TTokenType::Colon,   ":"};
+          case '[': ++pos; return {TTokenType::LBracket, "["};
+          case ']': ++pos; return {TTokenType::RBracket, "]"};
+          case '.': ++pos; return {TTokenType::Dot, "."};
+          case '&': ++pos; return {TTokenType::And, "&"};  
+          case '^': ++pos; return {TTokenType::XOR, "^"};  
+          case '|': ++pos; return {TTokenType::OR, "|"};  
+          case '!': ++pos; return {TTokenType::QMARK, "!"};  
+        }
+        // string literal
+        if (c=='"') {
+            ++pos; size_t st=pos;
+            while (pos&lt;s.size() && s[pos]!='"') ++pos;
+            std::string txt = s.substr(st, pos-st);
+            if (pos&lt;s.size()) ++pos;
+            return {TTokenType::StringLit, std::move(txt)};
+        }
+        
+        if (c=='0' && pos+1&lt;s.size() && (s[pos+1]=='x'||s[pos+1]=='X')) {
+            size_t st = pos;
+            pos += 2;
+            while (pos&lt;s.size() && isxdigit(s[pos])) ++pos;
+            std::string tok = s.substr(st, pos-st);
+            // convert to decimal string
+            unsigned long val = std::stoul(tok, nullptr, 16);
+            return {TTokenType::Number, std::to_string(val)};
+        }
+
+        // number
+        if (isdigit(c)||c=='.') {
+            size_t st=pos;
+            while (pos&lt;s.size() && (isdigit(s[pos])||s[pos]=='.')) ++pos;
+            return {TTokenType::Number, s.substr(st,pos-st)};
+        }
+
+        // identifier / keyword
+        if (isalpha(c)||c=='_') {
+            size_t st=pos;
+            while (pos&lt;s.size() && (isalnum(s[pos])||s[pos]=='_')) ++pos;
+            std::string w = s.substr(st,pos-st);
+            if      (w=="int")     return {TTokenType::IntKw,     w};
+            else if (w=="if")      return {TTokenType::IfKw,      w};
+            else if (w=="elif")    return {TTokenType::ElifKw, w};
+            else if (w=="else")    return {TTokenType::ElseKw,    w};
+            else if (w=="while")   return {TTokenType::WhileKw,   w};
+            else if (w=="for")     return {TTokenType::ForKw,     w};
+            else if (w=="import")  return {TTokenType::ImportKw,  w};
+            else if (w=="return")  return {TTokenType::ReturnKw,  w};
+            else if (w=="switch")  return {TTokenType::SwitchKw,  w};
+            else if (w=="case")    return {TTokenType::CaseKw,    w};
+            else if (w=="default") return {TTokenType::DefaultKw, w};
+            else if (w=="break")   return {TTokenType::BreakKw,   w};
+            else if (w=="struct")      return {TTokenType::StructKw, w};
+            else if (w=="ptr")     return {TTokenType::PtrKw,     w};
+            else if (w=="str")     return {TTokenType::StringKw, w};
+            else if (w=="arr")     return {TTokenType::ArrKw,    w};
+            else                   return {TTokenType::Identifier,w};
+        }
+
+        else {
+        std::cerr &lt;&lt; "Lexer | Error: Unknown Statement ( " &lt;&lt; c &lt;&lt; " )" &lt;&lt; std::endl;
+        }
+
+        ++pos;
+        return next();
+    }
+};
+
+// ——— Parser/Evaluator ————————————————————————————————————————————————
+class Parser {
+    std::vector&lt;Token&gt; toks;
+    size_t idx = 0;
+    std::unordered_map&lt;std::string,Value&gt; &vars;
+    std::unordered_map&lt;std::string,std::string&gt; &types;
+    std::unordered_map&lt;std::string,FuncPtr&gt; &funcs;
+    std::unordered_map&lt;std::string,FunctionDef&gt; &userFuncs;
+    bool hasReturn = false;
+    Value returnValue;
+    struct CallFrame {
+    std::vector&lt;Token&gt; bodyTokens;
+    size_t currentTokenIdx = 0;
+    std::unordered_map&lt;std::string, Value&gt; localVars;
+    std::unordered_map&lt;std::string, std::string&gt; localTypes;
+    bool hasReturn = false;
+    Value returnValue;
+};
+
+std::vector&lt;CallFrame&gt; callStack;
+
+
+
+public:
+    // Constructor takes the token vector by rvalue and the maps by reference
+    Parser(std::vector&lt;Token&gt;&& t,
+           std::unordered_map&lt;std::string, Value&gt;& v,
+           std::unordered_map&lt;std::string, std::string&gt;& ty,
+           std::unordered_map&lt;std::string, FuncPtr&gt;& f,
+           std::unordered_map&lt;std::string, FunctionDef&gt;& uf)
+        : toks(std::move(t)), vars(v), types(ty), funcs(f), userFuncs(uf) {}
+
+    static std::unordered_map&lt;std::string, std::vector&lt;std::pair&lt;std::string,std::string&gt;&gt;&gt; structDefs;
+
+    Token peek() const {
+        return idx &lt; toks.size() ? toks[idx] : Token{TTokenType::EOF_T,""};
+    }
+    Token peek(size_t offset) const {
+        size_t pos = idx + offset;
+        return pos &lt; toks.size() ? toks[pos] : Token{TTokenType::EOF_T,""};
+    }
+    Token get() {
+        return idx &lt; toks.size() ? toks[idx++] : Token{TTokenType::EOF_T,""};
+    }
+    void consume(TTokenType t) {
+        if (peek().type == t) get();
+    }
+
+    int prec(TTokenType t) {
+        switch (t) {
+            case TTokenType::Increment: return 30; 
+            case TTokenType::EqEq: case TTokenType::NotEq:
+            case TTokenType::Greater: case TTokenType::Less:
+            case TTokenType::GreaterEq: case TTokenType::LessEq: case TTokenType::QMARK:
+                return 5;
+            case TTokenType::Plus: case TTokenType::Minus:
+                return 10;
+            case TTokenType::Star: case TTokenType::Slash: case TTokenType::Mod:
+                return 20;
+            case TTokenType::And:     return 5;
+            case TTokenType::XOR: return 4;
+            case TTokenType::LShift: 
+            case TTokenType::RShift: return 8;
+            case TTokenType::LAND: 
+            case TTokenType::DTurnStile: 
+            return 2;
+            case TTokenType::OR: return 14;
+            default:
+                return -1;
+        }
+    }
+
+    // Parse a single statement, returning Value( NAN ) on a break
+     std::optional&lt;Value&gt; parseStmt() {
+        if (peek().type == TTokenType::IntKw && peek(1).type == TTokenType::Identifier 
+            && peek(2).type == TTokenType::LParen) {
+            return parseFunctionDef();
+        }
+
+        if (peek().type == TTokenType::StructKw) {
+            get();                             // consume 'struct'
+            auto nameTok = get();             // Identifier
+            std::string structName = nameTok.text;
+            consume(TTokenType::LBrace);       // '{'
+            std::vector&lt;std::pair&lt;std::string,std::string&gt;&gt; fields;
+            while (peek().type != TTokenType::RBrace) {
+                // Only support "int x;" or "string s;" for now
+                std::string ty = get().text;    // e.g. "int" or "string"
+                auto fieldTok = get();          // field name
+                std::string fieldName = fieldTok.text;
+                consume(TTokenType::Semicolon);  // ';'
+                fields.emplace_back(fieldName, ty);
+            }
+            consume(TTokenType::RBrace);
+            consume(TTokenType::Semicolon);    // require trailing ';'
+            structDefs[structName] = std::move(fields);
+            return Value();                   // no runtime effect yet
+}
+        switch (peek().type) {
+            case TTokenType::IfKw:     return parseIf();
+            case TTokenType::SwitchKw: return parseSwitch();
+            case TTokenType::ReturnKw: return parseReturn();
+            case TTokenType::WhileKw:  return parseWhile();
+            case TTokenType::ForKw:    parseFor(); return std::nullopt;
+            case TTokenType::LBrace:   parseBlock(); return Value(0);
+            case TTokenType::BreakKw:  get(); consume(TTokenType::Semicolon); return Value(NAN);
+            case TTokenType::ImportKw:
+              get(); // consume 'import'
+              if (peek().type == TTokenType::Identifier && peek().text == "type") {
+                  get(); // consume 'type'
+                  consume(TTokenType::Semicolon);
+                  funcs["cint"] = &cintFn;
+                  funcs["cstr"] = &cstrFn;
+                  return Value(0);
+              } else if (peek().type == TTokenType::Identifier && peek().text == "math") {
+                 get();
+                 consume(TTokenType::Semicolon);
+                 funcs["round"] = &roundFn;
+                 funcs["floor"] = &floorFn;
+                 funcs["ceil"] = &ceilFn;
+                 funcs["abs"] = &absFn;
+                 funcs["sqrt"] = &sqrtFn;
+                 funcs["sin"] = &sinFn;
+                 return Value(0);
+              } else if (peek().type == TTokenType::Identifier && peek().text == "string") {
+                 get();
+                 consume(TTokenType::Semicolon);
+                 funcs["slen"] = &slenFn;
+                 funcs["char"] = &charAtFn;
+                 funcs["up"] = &toUpperFn;
+                 funcs["low"] = &toLowerFn;
+                 funcs["trim"] = &trimFn;
+                 funcs["isdigit"] = &isDigitFn;
+                 funcs["endswith"] = &endsWithFn;
+                 funcs["startswith"] = &startsWithFn;
+                 funcs["slice"] = &sliceFn;
+                 funcs["split"] = &splitFn;
+                 funcs["format"] = &formatFn;
+                 
+                 return Value(0); 
+
+              } else if (peek().type == TTokenType::Identifier && peek().text == "array") {
+                 get();
+                 consume(TTokenType::Semicolon);
+
+                 funcs["push"] = &pushFn;
+                 funcs["pop"] = &popFn;
+                 funcs["alice"] = &aliceFn;
+                 funcs["join"] = &joinFn;
+                 funcs["reverse"] = &reverseFn;
+                 funcs["removeAt"] = &removeAtFn;
+
+                 return Value(0); 
+              } else if (peek().type == TTokenType::Identifier && peek().text == "memory") {
+                 get();
+                 consume(TTokenType::Semicolon);
+                 funcs["malloc"]  = &mallocFn;
+                 funcs["free"]    = &freeFn;
+                 funcs["load8"]   = &load8Fn;
+                 funcs["store8"]  = &store8Fn;
+                 funcs["load32"]  = &load32Fn;
+                 funcs["store32"] = &store32Fn;
+                 return Value(0);
+              } else if (peek().type == TTokenType::Identifier && peek().text == "winapi") {
+                 get();
+                 consume(TTokenType::Semicolon);
+                 funcs["winmsgBox"] = &winmessageBoxFn;
+                 funcs["winbeep"] = &winBeepFn;
+                 funcs["winsetClip"] = &winSetClipboardFn;
+                 funcs["setCursorPos"] = &winSetCursorPosFn;
+                 funcs["winrocess"] = &winRunProcessFn;
+                 funcs["winCreate"] = &winCreateWindowFn;
+                 funcs["wincomL"] = &winMessageLoopFn;
+                 funcs["wingetDC"] = &winGetDCFn;
+                 funcs["winrelDC"] = &winReleaseDCFn;
+                 funcs["windrawt"] = &winDrawTextFn;
+                 funcs["winfillrec"] = &winFillRectFn;
+                 funcs["winpollEvents"] = &winPollEventsFn;
+
+
+                 return Value(0);
+             
+              } else if (peek().type == TTokenType::Identifier && peek().text == "opengl") {
+                 
+                 get();
+                 consume(TTokenType::Semicolon);
+                 funcs["GLContext"] = &winCreateGLContextFn;
+                 funcs["glswapBuffers"] = &winSwapBuffersFn;
+                 funcs["glclear"] = &winClearScreenFn;
+                 funcs["glColor3f"] = &glColor3fFn;
+                 funcs["glVertex3f"] = &glVertex3fFn;
+                 funcs["glEnd"] = &glEndFn;
+                 funcs["glBegin"] = &glBeginFn;
+                 funcs["resizeViewport"] = &winResizeViewportFn;
+                 funcs["glTranslatef"] = &glTranslatefFn;
+                 funcs["glRotatef"] = &glRotatefFn;
+                 funcs["glScalef"] = &glScalefFn;
+                 funcs["glPushMatrix"] = &glPushMatrixFn;
+                 funcs["glPopMatrix"] = &glPopMatrixFn;
+                 funcs["glOrtho"] = &glOrthoFn;
+                 funcs["glFrustum"] = &glFrustumFn;
+                 funcs["glEnable"] = &glEnableFn;
+                 funcs["glDisable"] = &glDisableFn;
+                 funcs["glMatrixMode"] = &glMatrixModeFn;
+
+
+                 return Value(0);
+              }
+              
+              else {
+                  std::cerr &lt;&lt; "Unknown import\n";
+                  return Value(0);
+              }
+            default: {
+                std::string lhs; bool isDecl = false;
+                Value v = parseLine(lhs, isDecl);
+                if (!lhs.empty()) {
+                    vars[lhs] = v;
+                    types[lhs] = isDecl
+                    ? /* you know which keyword you matched: "int","str","arr","ptr"… */ ""
+                    : (v.kind == Value::STR ? "str"
+                        : v.kind == Value::ARR ? "arr"
+                        : "int");
+                }
+                return v;
+            }
+        }
+    }
+
+  private:
+    
+   Value parseIf() {
+    // — consume `if (cond) { … }`
+    get();                    // consume 'if'
+    consume(TTokenType::LParen);
+    Value cond = parseExpr(0);
+    consume(TTokenType::RParen);
+
+    // If the `if` is true, execute it and skip **all** the rest
+    if (cond.kind == Value::NUM && cond.num != 0) {
+        parseBlock();
+        // skip any remaining elif/else
+        while (peek().type == TTokenType::ElifKw || peek().type == TTokenType::ElseKw) {
+            get();           // consume 'elif' or 'else'
+            skipBlock();
+        }
+        return Value(0);
+    }
+
+    // Otherwise, skip the `if` block and try each `elif`
+    skipBlock();
+
+    while (peek().type == TTokenType::ElifKw) {
+        get();                  // consume 'elif'
+        consume(TTokenType::LParen);
+        Value elifCond = parseExpr(0);
+        consume(TTokenType::RParen);
+
+        if (elifCond.kind == Value::NUM && elifCond.num != 0) {
+            parseBlock();
+            // we found a matching elif, so skip any remaining elif/else
+            while (peek().type == TTokenType::ElifKw || peek().type == TTokenType::ElseKw) {
+                get();
+                skipBlock();
+            }
+            return Value(0);
+        } else {
+            skipBlock();
+        }
+    }
+
+    // Finally, if there's an `else`, run it
+    if (peek().type == TTokenType::ElseKw) {
+        get();      // consume 'else'
+        parseBlock();
+    }
+
+    return Value(0);
+}
+
+
+    std::optional&lt;Value&gt; parseSwitch() {
+    // 1) Consume "switch", parse the controlling expression, eat '(' ')' and '{'
+    get();                         // switch
+    consume(TTokenType::LParen);
+    Value control = parseExpr(0);
+    consume(TTokenType::RParen);
+    consume(TTokenType::LBrace);
+
+    // 2) Read each label—even if we skip it, we always consume its body
+    bool matched = false;
+    Value lastVal; // (in case you want the case to produce a value)
+    while (peek().type != TTokenType::RBrace && peek().type != TTokenType::EOF_T) {
+        //  ─── Case label? ─────────────────────────────────────────────
+        if (peek().type == TTokenType::CaseKw) {
+            get();                    // consume 'case'
+            Value label = parseExpr(0);
+            consume(TTokenType::Colon);
+
+            bool nowMatch =
+                (!matched) &&                        // only first match
+                label.kind == control.kind &&       // same type
+                ((label.kind == Value::NUM && label.num == control.num) ||
+                 (label.kind == Value::STR && label.str == control.str));
+
+            // Execute or skip this case’s body
+            if (nowMatch) {
+                matched = true;
+                // Run until we hit 'break;', next label, or end‑brace
+                while (peek().type != TTokenType::CaseKw &&
+                       peek().type != TTokenType::DefaultKw &&
+                       peek().type != TTokenType::RBrace) {
+                    if (peek().type == TTokenType::BreakKw) {
+                        // on break, consume it and exit switch entirely
+                        get(); consume(TTokenType::Semicolon);
+                        // skip to closing '}'
+                        while (peek().type != TTokenType::RBrace && peek().type != TTokenType::EOF_T)
+                            get();
+                        consume(TTokenType::RBrace);
+                        return lastVal;
+                    }
+                    if (auto stmtResult = parseStmt()) lastVal = *stmtResult;
+                }
+                // once we exit this inner loop, we've either hit a next label or '}', so
+                // we can exit the entire switch now (prevent fall‑through)
+                while (peek().type != TTokenType::RBrace && peek().type != TTokenType::EOF_T)
+                    get();
+                consume(TTokenType::RBrace);
+                return lastVal;
+            } else {
+                // not matched: skip over this case’s body entirely
+                int depth = 0;
+                while (!(peek().type == TTokenType::CaseKw ||
+                         peek().type == TTokenType::DefaultKw ||
+                         (peek().type == TTokenType::RBrace && depth == 0))) 
+                {
+                    if (peek().type == TTokenType::LBrace)  { depth++; get(); }
+                    else if (peek().type == TTokenType::RBrace) { depth--; get(); }
+                    else get();
+                }
+            }
+        }
+        //  ─── Default label? ──────────────────────────────────────────
+        else if (peek().type == TTokenType::DefaultKw) {
+            get();                     // consume 'default'
+            consume(TTokenType::Colon);
+
+            // Only execute default if *no* case has matched
+            if (!matched) {
+                matched = true;
+                while (peek().type != TTokenType::CaseKw &&
+                       peek().type != TTokenType::RBrace) {
+                    if (peek().type == TTokenType::BreakKw) {
+                        get(); consume(TTokenType::Semicolon);
+                        while (peek().type != TTokenType::RBrace && peek().type != TTokenType::EOF_T)
+                            get();
+                        consume(TTokenType::RBrace);
+                        return lastVal;
+                    }
+                    if (auto stmtResult = parseStmt()) lastVal = *stmtResult;
+                }
+                while (peek().type != TTokenType::RBrace && peek().type != TTokenType::EOF_T)
+                    get();
+                consume(TTokenType::RBrace);
+                return lastVal;
+            } else {
+                // default but already matched a case: skip its body
+                int depth = 0;
+                while (!(peek().type == TTokenType::CaseKw ||
+                         (peek().type == TTokenType::RBrace && depth == 0)))
+                {
+                    if (peek().type == TTokenType::LBrace)  { depth++; get(); }
+                    else if (peek().type == TTokenType::RBrace) { depth--; get(); }
+                    else get();
+                }
+            }
+        }
+        //  ─── Anything else (stray statements) ────────────────────────
+        else {
+            parseStmt();
+        }
+    }
+
+    // 3) Close out the switch if we fell off the end without hitting a return above
+    consume(TTokenType::RBrace);
+    return lastVal;
+}
+    
+
+    void parseFor() {
+    get(); // Consume 'for'
+    consume(TTokenType::LParen);
+
+    // Parse initialization
+    std::string initVar;
+    bool isDecl = false;
+    if (peek().type != TTokenType::Semicolon) {
+        Value initVal = parseLine(initVar, isDecl, true); // Handles declarations/expressions and consumes ';'
+        if (!initVar.empty()) {
+            vars[initVar] = initVal;
+        }
+    } else {
+        get(); // Consume ';'
+    }
+
+    // Parse condition (save position)
+    size_t condPos = idx;
+    Value cond;
+    if (peek().type != TTokenType::Semicolon) {
+        cond = parseExpr(0);
+    } else {
+        cond = Value(1.0); // Default to true
+    }
+    consume(TTokenType::Semicolon);
+
+    // Parse increment (save tokens)
+    size_t incrStart = idx;
+    while (peek().type != TTokenType::RParen) {
+        get(); // Advance past increment expression
+    }
+    size_t incrEnd = idx;
+    consume(TTokenType::RParen);
+
+    // Parse body (save position)
+    size_t bodyStart = idx;
+    skipBlock();
+    size_t bodyEnd = idx;
+
+    // Execute loop
+    while (true) {
+        // Evaluate condition
+        idx = condPos;
+        Value condVal = parseExpr(0);
+        if (condVal.kind != Value::NUM || condVal.num == 0.0) break;
+
+        // Execute body
+        idx = bodyStart;
+        parseBlock();
+
+        // Execute increment
+        idx = incrStart;
+        if (incrStart &lt; incrEnd) {
+            Parser incrParser(std::vector&lt;Token&gt;(toks.begin() + incrStart, toks.begin() + incrEnd), vars, types, funcs, userFuncs);
+            incrParser.parseStmt();
+        }
+    }
+
+    idx = bodyEnd; // Move past the loop
+}
+
+
+    Value parseFunctionDef() {
+        get(); // consume 'int'
+        std::string funcName = get().text; // function name
+        get(); // consume '('
+        
+        FunctionDef def;
+        def.returnType = "int";
+        
+        // Parse parameters
+        while (peek().type != TTokenType::RParen) {
+            Token paramName = get();
+            def.params.push_back(paramName.text);
+            if (peek().type == TTokenType::Comma) get();
+        }
+        consume(TTokenType::RParen);
+        consume(TTokenType::LBrace);
+        
+        // Capture function body tokens
+        int braceDepth = 1;
+        while (braceDepth &gt; 0 && peek().type != TTokenType::EOF_T) {
+            Token t = get();
+            if (t.type == TTokenType::LBrace) braceDepth++;
+            else if (t.type == TTokenType::RBrace) braceDepth--;
+            if (braceDepth &gt; 0) def.bodyTokens.push_back(t);
+        }
+        
+        userFuncs[funcName] = def;
+        return Value();
+    }
+
+    Value parseReturn() {
+    get(); // consume 'return'
+
+    // Tail-call detection (leave unchanged)
+    if (peek().type == TTokenType::Identifier && peek(1).type == TTokenType::LParen) {
+        std::string funcName = peek().text;
+        get(); get(); // consume identifier and '('
+        std::vector&lt;Value&gt; args;
+        if (peek().type != TTokenType::RParen) {
+            do {
+                args.push_back(parseExpr(0));
+            } while (peek().type == TTokenType::Comma && (get(), true));
+        }
+        consume(TTokenType::RParen);
+        consume(TTokenType::Semicolon);
+
+        hasReturn = true;
+        returnValue = Value(TailCallInfo{funcName, args});
+        return returnValue;
+    }
+
+    // Support multiple return expressions: return x+y, x-y;
+    std::vector&lt;Value&gt; values;
+    values.push_back(parseExpr(0));
+
+    while (peek().type == TTokenType::Comma) {
+        get(); // consume comma
+        values.push_back(parseExpr(0));
+    }
+
+    consume(TTokenType::Semicolon);
+    hasReturn = true;
+
+    // If single value: return it as-is; if multiple: return array
+    if (values.size() == 1) {
+        returnValue = values[0];
+        return values[0];
+    } else {
+        returnValue = Value(std::move(values));
+        return returnValue;
+    }
+}
+
+
+
+    Value executeUserFunction(const FunctionDef& initialFunc, const std::vector&lt;Value&gt;& initialArgs) {
+    FunctionDef currentFunc = initialFunc;
+    std::vector&lt;Value&gt; currentArgs = initialArgs;
+
+    while (true) {
+        // Set up frame
+        CallFrame frame;
+        frame.bodyTokens = currentFunc.bodyTokens;
+        for (size_t i = 0; i &lt; currentFunc.params.size(); ++i) {
+            frame.localVars[currentFunc.params[i]] = i &lt; currentArgs.size() ? currentArgs[i] : Value(0);
+            frame.localTypes[currentFunc.params[i]] = "int";
+        }
+
+        callStack.push_back(frame);
+        Parser funcParser(std::vector&lt;Token&gt;(frame.bodyTokens),
+                          frame.localVars,
+                          frame.localTypes,
+                          funcs,
+                          userFuncs);
+
+        while (funcParser.peek().type != TTokenType::EOF_T && !funcParser.hasReturn) {
+            funcParser.parseStmt();
+        }
+
+        callStack.pop_back();
+
+        // Check if return is a tail call
+        if (funcParser.returnValue.kind == Value::TAILCALL) {
+    // Grab the shared_ptr&lt;TailCallInfo&gt;
+    auto infoPtr = funcParser.returnValue.tailcall;
+    if (!infoPtr) {
+        std::cerr &lt;&lt; "Internal error: tailcall info missing\n";
+        break;
+    }
+
+    // 1) Log it
+    // std::cout &lt;&lt; "Calling tail‑call of “" 
+              //&lt;&lt; infoPtr-&gt;funcName &lt;&lt; "” with "
+             // &lt;&lt; infoPtr-&gt;args.size() &lt;&lt; " args\n";
+
+    // 2) Look up the FunctionDef in userFuncs
+    auto it = userFuncs.find(infoPtr-&gt;funcName);
+    if (it == userFuncs.end()) {
+        std::cerr &lt;&lt; "Unknown function: " 
+                  &lt;&lt; infoPtr-&gt;funcName &lt;&lt; "\n";
+        return Value();  // or handle error
+    }
+
+    // 3) Prepare for the next iteration
+    currentFunc = it-&gt;second;            // FunctionDef
+    currentArgs = infoPtr-&gt;args;         // vector&lt;Value&gt;
+
+    // tail‑call → loop again with new currentFunc/currentArgs
+    continue;
+}
+
+
+        return funcParser.returnValue;  // Normal return
+    }
+}
+
+
+    // ─── while ─────────────────────────────────────────────────────────
+    Value parseWhile() {
+        get(); consume(TTokenType::LParen);
+        size_t condPos = idx;
+        Value cond = parseExpr(0);
+        consume(TTokenType::RParen);
+        size_t bodyPos = idx;
+        while (cond.kind==Value::NUM && cond.num) {
+            idx = bodyPos;
+            parseBlock();
+            idx = condPos;
+            cond = parseExpr(0);
+            consume(TTokenType::RParen);
+        }
+        skipBlock();
+        return Value(0);
+    }
+
+    // ─── block helpers ──────────────────────────────────────────────────
+    void parseBlock() {
+        consume(TTokenType::LBrace);
+        while (peek().type!=TTokenType::RBrace && peek().type!=TTokenType::EOF_T)
+            parseStmt();
+        consume(TTokenType::RBrace);
+    }
+    void skipBlock() {
+        int d = 1;
+        consume(TTokenType::LBrace);
+        while (d&gt;0 && peek().type!=TTokenType::EOF_T) {
+            if (peek().type==TTokenType::LBrace) { d++; get(); }
+            else if (peek().type==TTokenType::RBrace) { d--; get(); }
+            else get();
+        }
+    }
+
+    // ─── declaration / assignment / expr ───────────────────────────────
+    Value parseLine(std::string &outVar, bool &isDecl, bool suppressOutput = false) {
+        outVar.clear(); isDecl = false;
+
+        // ——— field-assignment: foo.bar = expr; —————
+        if (peek().type == TTokenType::Identifier
+            && toks[idx+1].type == TTokenType::Dot
+            && toks[idx+2].type == TTokenType::Identifier
+            && toks[idx+3].type == TTokenType::Assign)
+        {
+        std::string varName   = get().text;   // 'foo'
+        get();                                // consume '.'
+        std::string fieldName = get().text;   // 'bar'
+        get();                                // consume '='
+        Value newVal = parseExpr(0);
+        consume(TTokenType::Semicolon);
+
+        auto it = vars.find(varName);
+        if (it == vars.end() || it-&gt;second.kind != Value::STRUCT) {
+            std::cerr &lt;&lt; "Cannot assign to field of non-struct\n";
+        } else {
+            it-&gt;second.fields[fieldName] = newVal;
+        }
+        return newVal;
+}
+        
+        // struct‐typed declaration:
+        if (peek().type == TTokenType::Identifier &&
+            structDefs.count(peek().text) &&
+            peek(1).type == TTokenType::Identifier)
+        {
+        // e.g. "Point p" or "Point p = Point(...);"
+        std::string structName = get().text;
+        std::string varName    = get().text;
+        bool isDecl = true;     // for types[]
+        Value v;                // default Value::STRUCT
+        if (peek().type == TTokenType::Assign) {
+            get(); // '='
+            v = parseExpr(0);
+        } else {
+            // default‐construct:  all numeric fields = 0, strings empty
+            v = Value::makeStruct(structName, {});  
+        }
+        consume(TTokenType::Semicolon);
+        outVar = varName;
+        isDecl = true;
+        return v;
+}
+        
+        // ——— field compound‐assignment: foo.bar += expr; —————
+        if (peek().type   == TTokenType::Identifier
+        && toks[idx+1].type == TTokenType::Dot
+        && toks[idx+2].type == TTokenType::Identifier
+        && toks[idx+3].type == TTokenType::PlusAssign)
+        {
+            std::string varName   = get().text;   // 'foo'
+            get();                                // consume '.'
+            std::string fieldName = get().text;   // 'bar'
+            get();                                // consume '+='
+
+            // Parse RHS expression:
+            Value rhs = parseExpr(0);
+            consume(TTokenType::Semicolon);
+
+            // Lookup the variable:
+            auto it = vars.find(varName);
+            if (it == vars.end() || it-&gt;second.kind != Value::Kind::STRUCT) {
+            std::cerr &lt;&lt; "Cannot apply '+=' to field of non‐struct\n";
+            return Value();  // or some error Value
+            }
+
+            // Fetch current field value:
+            Value& fieldVal = it-&gt;second.fields[fieldName];
+
+            // Perform addition (requires you’ve overloaded operator+ on Value):
+            fieldVal = fieldVal + rhs;
+
+            return fieldVal;
+          }
+
+        // ——— field compound‐assignment: foo.bar -= expr; —————
+if (peek().type     == TTokenType::Identifier
+ && toks[idx+1].type == TTokenType::Dot
+ && toks[idx+2].type == TTokenType::Identifier
+ && toks[idx+3].type == TTokenType::MinusAssign)
+{
+    // Consume `foo.bar -=`
+    std::string varName   = get().text;  // 'foo'
+    get();                               // '.'
+    std::string fieldName = get().text;  // 'bar'
+    get();                               // '-='
+
+    // Parse right‐hand side
+    Value rhs = parseExpr(0);
+    consume(TTokenType::Semicolon);
+
+    // Lookup the struct variable
+    auto it = vars.find(varName);
+    if (it == vars.end() || it-&gt;second.kind != Value::Kind::STRUCT) {
+      std::cerr &lt;&lt; "Cannot apply '-=' to field of non‐struct\n";
+      return Value();
+    }
+
+    // Perform subtraction
+    Value& fieldVal = it-&gt;second.fields[fieldName];
+    fieldVal = fieldVal - rhs;
+
+    return fieldVal;
+}
+
+
+        if (peek().type == TTokenType::IntKw) {
+            get();
+            if (peek().type == TTokenType::Identifier) {
+                outVar = get().text;
+                isDecl = true;
+                get(); // '='
+                Value v = parseExpr(0);
+                consume(TTokenType::Semicolon);
+                return v;
+            }
+        }
+
+
+        if (peek().type == TTokenType::PtrKw) {
+            get();  // consume 'ptr'
+            // next token must be var name
+            if (peek().type == TTokenType::Identifier) {
+                outVar = get().text;
+                isDecl = true;
+                // require '=' and expression
+                consume(TTokenType::Assign);
+                Value v = parseExpr(0);
+                consume(TTokenType::Semicolon);
+                return v;
+            }
+    }
+
+        if (peek().type == TTokenType::StringKw) {
+            // consume 'str'
+            get();
+            // next must be variable name
+            std::string name = get().text;
+            bool isDecl = true;
+            // require '=' and a string literal or expression
+            consume(TTokenType::Assign);
+            Value v = parseExpr(0);
+            consume(TTokenType::Semicolon);
+            outVar = name;
+            isDecl = true;
+            return v;  // v.kind should be STR
+}
+        if (peek().type == TTokenType::ArrKw) {
+            // consume 'arr'
+            get();
+            std::string name = get().text;
+            bool isDecl = true;
+            consume(TTokenType::Assign);
+            // parseExpr already handles '['…']' into an ARR Value
+            Value v = parseExpr(0);
+            consume(TTokenType::Semicolon);
+            outVar = name;
+            isDecl = true;
+            return v;  // v.kind should be ARR
+}
+
+        if (peek().type == TTokenType::Identifier &&
+    toks.size() &gt; idx + 1 &&
+    (toks[idx + 1].type == TTokenType::Assign || toks[idx + 1].type == TTokenType::PlusAssign))
+{
+    outVar = get().text;  // variable name
+    Token op = get();     // '=' or '+='
+
+    Value rhs = parseExpr(0);
+    consume(TTokenType::Semicolon);
+
+    if (op.type == TTokenType::PlusAssign) {
+        // Implement += logic here:
+        if (vars.find(outVar) == vars.end()) {
+            std::cerr &lt;&lt; "Unknown variable: " &lt;&lt; outVar &lt;&lt; "\n";
+            return Value(0);
+        }
+        Value &lhs = vars[outVar];
+
+        // Handle array += push(...) — arrays only for now:
+        if (lhs.kind == Value::ARR && rhs.kind == Value::ARR) {
+            lhs.arr.insert(lhs.arr.end(), rhs.arr.begin(), rhs.arr.end());
+            return lhs;
+        }
+
+        // For strings and numbers, you can extend this similarly
+        if (lhs.kind == Value::STR && rhs.kind == Value::STR) {
+            lhs.str += rhs.str;
+            return lhs;
+        }
+        if (lhs.kind == Value::NUM && rhs.kind == Value::NUM) {
+            lhs.num += rhs.num;
+            return lhs;
+        }
+
+        std::cerr &lt;&lt; "Unsupported types for += operator\n";
+        return Value(0);
+    } else {
+        // normal assignment
+        return rhs;
+    }
+}
+        
+
+        if (peek().type == TTokenType::Identifier && 
+        toks.size() &gt; idx + 2 &&               // ensure tokens after
+        toks[idx + 1].type == TTokenType::Arrow &&  // '-&gt;' token type
+        toks[idx + 2].type == TTokenType::Identifier) // second var
+    {
+        std::string var1 = get().text;  // consume first var (x)
+        get();  // consume '-&gt;'
+        std::string var2 = get().text;  // consume second var (y)
+        consume(TTokenType::Semicolon);
+
+        auto it1 = vars.find(var1);
+        auto it2 = vars.find(var2);
+        if (it1 == vars.end() || it2 == vars.end()) {
+            std::cerr &lt;&lt; "Undefined variable(s) in swap\n";
+            return Value(0);
+        }
+
+        // Swap the values
+        std::swap(it1-&gt;second, it2-&gt;second);
+
+        // Return something useful — let's say the new value of var1
+        return it1-&gt;second;
+    }
+
+        Value v = parseExpr(0);
+        consume(TTokenType::Semicolon);
+        return suppressOutput ? Value() : v;
+    }
+
+    // ─── Pratt expression parser ────────────────────────────────────────
+    Value parseExpr(int minP) {
+        
+        Value lhs = parsePrimary();
+        while (true) {
+            Token op = peek();
+
+            if (op.type == TTokenType::Dot) {
+                get();                           // consume '.'
+                Token fld = get();               // should be Identifier
+                if (fld.type != TTokenType::Identifier) {
+                    std::cerr &lt;&lt; "Syntax error: expected field name after '.'\n";
+                    return Value();
+                }
+               if (lhs.kind != Value::STRUCT) {
+                   std::cerr &lt;&lt; "Cannot access field of non‑struct\n";
+                    return Value();
+                }
+                // pull out the field (or default‑construct NONE)
+                auto fit = lhs.fields.find(fld.text);
+                lhs = (fit != lhs.fields.end()
+                           ? fit-&gt;second
+                           : Value());
+                continue;  // allow chaining: e.g. foo.bar.baz
+            }
+
+            if (op.type == TTokenType::LBracket) {
+            get(); // consume '['
+            Value indexVal = parseExpr(0);
+            consume(TTokenType::RBracket);
+
+            if (lhs.kind != Value::ARR) {
+                std::cerr &lt;&lt; "Indexing requires an array\n";
+                return Value(0);
+            }
+            if (indexVal.kind != Value::NUM) {
+                std::cerr &lt;&lt; "Array index must be a number\n";
+                return Value(0);
+            }
+
+            int idx = static_cast&lt;int&gt;(indexVal.num);
+            if (idx &lt; 0 || idx &gt;= (int)lhs.arr.size()) {
+                std::cerr &lt;&lt; "Array index out of bounds\n";
+                return Value(0);
+            }
+            lhs = lhs.arr[idx];
+            continue;
+        }
+            int p = prec(op.type);
+            if (p &lt; minP) break;
+            get();
+            
+            Value rhs = parseExpr(p+1);
+
+            if (op.type == TTokenType::Increment) {
+              // Must be an identifier
+              if (lhs.kind != Value::NUM) {
+                  std::cerr &lt;&lt; "Increment requires a numeric variable\n";
+                  return Value(0);
+              }
+              // Look behind to get the variable name from the token stream
+              if (idx &lt; 2 || toks[idx - 2].type != TTokenType::Identifier) {
+                  std::cerr &lt;&lt; "Invalid increment target\n";
+                  return Value(0);
+              }
+              std::string varName = toks[idx - 2].text;
+              if (vars.find(varName) == vars.end()) {
+                  std::cerr &lt;&lt; "Unknown variable: " &lt;&lt; varName &lt;&lt; "\n";
+                  return Value(0);
+              }
+              vars[varName].num += 1;
+              lhs.num += 1; // Return incremented value (could also return old if using post-increment logic)
+              continue;
+            }
+
+            if (op.type==TTokenType::Plus && lhs.kind==Value::STR && rhs.kind==Value::STR) {
+                lhs = Value(lhs.str + rhs.str);
+                continue;
+            }
+
+            if (op.type == TTokenType::Minus && lhs.kind == Value::STR && rhs.kind == Value::STR) {
+              std::string result = lhs.str;
+              size_t pos;
+              while ((pos = result.find(rhs.str)) != std::string::npos) {
+                  result.erase(pos, rhs.str.length());
+              }
+              lhs = Value(result);
+              continue;
+            }
+
+            if (op.type == TTokenType::Star && lhs.kind == Value::STR && rhs.kind == Value::NUM) {
+                std::string result;
+                for (int i = 0; i &lt; static_cast&lt;int&gt;(rhs.num); ++i) {
+                    result += lhs.str;
+                }
+                lhs = Value(result);
+                continue;
+            }
+
+             if (op.type == TTokenType::Plus && lhs.kind == Value::STR && rhs.kind == Value::NUM) {
+                std::string result;
+                for (int i = 0; i &lt; static_cast&lt;int&gt;(rhs.num); ++i) {
+                    result += lhs.str;
+                }
+                lhs = Value(result);
+                continue;
+            }
+
+            if (op.type == TTokenType::EqEq || op.type == TTokenType::NotEq) {
+        if (lhs.kind == Value::STR && rhs.kind == Value::STR) {
+            bool eq = (lhs.str == rhs.str);
+           bool result = (op.type == TTokenType::EqEq) ? eq : !eq;
+           // represent true/false as 1.0/0.0 as your runtime requires
+           lhs = Value(result ? 1.0 : 0.0);
+           continue;
+        }
+        // (optionally) you can also compare numbers here
+        // or even arrays/structs, before falling back below.
+    }
+
+            if (op.type == TTokenType::Minus && lhs.kind == Value::STR && rhs.kind == Value::NUM) {
+                std::string result = lhs.str;
+                for (int i = 0; i &lt; static_cast&lt;int&gt;(rhs.num); ++i) {
+                    size_t pos;
+                    while ((pos = result.find(lhs.str)) != std::string::npos) {
+                        result.erase(pos, lhs.str.length());
+                    }
+                }
+                lhs = Value(result);
+                continue;
+            }
+
+            if (op.type == TTokenType::QMARK && lhs.kind == Value::STR && rhs.kind == Value::STR) {
+                std::string result = lhs.str;
+                size_t pos;
+                while ((pos = result.find(rhs.str)) != std::string::npos) {
+                    result.erase(pos, rhs.str.length());
+                }
+
+                lhs = Value(result);
+                continue;
+            }
+
+            if (lhs.kind!=Value::NUM || rhs.kind!=Value::NUM) {
+                std::cerr&lt;&lt;"Type error in op\n"; return Value(0);
+            }
+
+            int L=static_cast&lt;int&gt;(lhs.num), R=static_cast&lt;int&gt;(rhs.num), res=0;
+
+            switch (op.type) {
+                case TTokenType::Plus:      res=L+R; break;
+                case TTokenType::Minus:     res=L-R; break;
+                case TTokenType::Star:      res=L*R; break;
+                case TTokenType::Slash:     res=L/R; break;
+                case TTokenType::Mod:       res=std::fmod(L,R); break;
+                case TTokenType::Greater:   res=(L&gt;R); break;
+                case TTokenType::Less:      res=(L&lt;R); break;
+                case TTokenType::GreaterEq: res=(L&gt;=R); break;
+                case TTokenType::LessEq:    res=(L&lt;=R); break;
+                case TTokenType::EqEq:      res=(L==R); break;
+                case TTokenType::NotEq:     res=(L!=R); break;
+                case TTokenType::And:       res = (L & R); break;
+                case TTokenType::XOR:       res = (L ^ R); break;
+                case TTokenType::LShift:       res = (L &lt;&lt; R); break;
+                case TTokenType::RShift:       res = (L &gt;&gt; R); break;
+                case TTokenType::LAND:       res = (L && R); break;
+                case TTokenType::OR:       res = (L | R); break;
+                case TTokenType::DTurnStile:       res = (L |= R); break;
+                default: break;
+            }
+            lhs = Value(res);
+        }
+        return lhs;
+    }
+
+    // ─── Primary ────────────────────────────────────────────────────────
+    Value parsePrimary() {
+        Token t = peek();
+
+        if (t.type == TTokenType::Minus || t.type == TTokenType::Plus) {
+        get();  // consume '+' or '-'
+        Value v = parsePrimary();   // recurse to bind tightly
+        if (v.kind != Value::NUM) {
+            std::cerr &lt;&lt; "Unary " &lt;&lt; t.text &lt;&lt; " requires a number\n";
+            return Value(0);
+        }
+        return Value(t.type == TTokenType::Minus
+                         ? -v.num
+                         :  v.num);
+    }
+
+        if (t.type == TTokenType::XOR) {
+            get();  // consume ^
+            Value v = parsePrimary();  // recursively parse the thing after ^
+
+            if (v.kind != Value::STR) {
+                std::cerr &lt;&lt; "Uppercase operator (^) requires a string\n";
+                return Value(0);
+            }
+
+            std::string upperStr = v.str;
+            std::transform(upperStr.begin(), upperStr.end(), upperStr.begin(), ::toupper);
+            return Value(upperStr);
+        }
+
+        if (t.type == TTokenType::And) {
+            get();  // consume '&'
+            Value operand = parsePrimary();  // recurse on the next expression
+
+            if (operand.kind != Value::STR) {
+                std::cerr &lt;&lt; "Unary '&' only works on strings (reversal)\n";
+                return Value(0);
+            }
+
+            std::string reversed = operand.str;
+            std::reverse(reversed.begin(), reversed.end());
+            return Value(reversed);
+        }
+
+        if (t.type==TTokenType::Number) {
+            get(); return Value(std::stod(t.text));
+        }
+
+        if (t.type==TTokenType::StringLit) {
+            get(); return Value(t.text);
+        }
+
+        if (t.type==TTokenType::Identifier) {
+            get();  // consume identifier
+            std::string varName = t.text;
+
+            if (peek().type == TTokenType::Dtune) {
+                get();
+                auto it = vars.find(t.text);
+
+                it-&gt;second.num = it-&gt;second.num / it-&gt;second.num;
+                return it-&gt;second;  
+            }
+
+            if (peek().type == TTokenType::ModSelf) {
+                get();
+                auto it = vars.find(t.text);
+
+                it-&gt;second.num = fmod(it-&gt;second.num, it-&gt;second.num);
+                return it-&gt;second;  
+            }
+
+            if (peek().type == TTokenType::LParen) {
+                get(); // '('
+                std::vector&lt;Value&gt; args;
+                if (peek().type != TTokenType::RParen) {
+                    do { args.push_back(parseExpr(0)); }
+                    while (peek().type == TTokenType::Comma && (get(), true));
+                }
+                consume(TTokenType::RParen);
+
+                // ——— struct constructor? ——————————————————
+                auto sd_it = structDefs.find(varName);
+                if (sd_it != structDefs.end()) {
+                 return Value::makeStruct(varName, args);
+                }
+                // ————————————————————————————— end struct ctor —
+
+                
+                // Check built-in functions first
+                auto builtIn = funcs.find(varName);
+                if (builtIn != funcs.end()) {
+                    return builtIn-&gt;second(args);
+                }
+                // Then check user-defined functions
+                else if (auto userFunc = userFuncs.find(varName); userFunc != userFuncs.end()) {
+                    return executeUserFunction(userFunc-&gt;second, args);
+                }
+                else {
+                    std::cerr &lt;&lt; "Unknown function: " &lt;&lt; varName &lt;&lt; "\n";
+                    return Value(0);
+                }
+            }
+
+            auto it = vars.find(varName);
+            if (it == vars.end()) {
+                std::cerr &lt;&lt; "Undefined variable: " &lt;&lt; varName &lt;&lt; "\n";
+                return Value(0);
+            }
+
+            // 🆕 Handle post-increment
+            if (peek().type == TTokenType::Increment) {
+                get();  // consume '++'
+                if (it-&gt;second.kind != Value::NUM) {
+                    std::cerr &lt;&lt; "Increment only valid on numbers\n";
+                    return Value(0);
+                }
+                double oldVal = it-&gt;second.num;
+                it-&gt;second.num += 1;
+                return Value(oldVal);  // post-increment behavior: return original value
+            }
+
+            if (peek().type == TTokenType::Decrement) {
+                get();  // consume '--'
+
+                if (it-&gt;second.kind == Value::NUM) {
+                    // Simple number decrement
+                    double oldVal = it-&gt;second.num;
+                    it-&gt;second.num -= 1;
+                    return Value(oldVal);
+
+                } else if (it-&gt;second.kind == Value::ARR) {
+                    // Decrement last element if it's a number
+                    if (it-&gt;second.arr.empty()) {
+                        std::cerr &lt;&lt; "Decrement on empty array is invalid\n";
+                        return Value(0);
+                    }
+
+                Value& lastElem = it-&gt;second.arr.back();
+                if (lastElem.kind != Value::NUM) {
+                    std::cerr &lt;&lt; "Decrement only valid on numbers (last element of array)\n";
+                    return Value(0);
+                }
+
+                double oldVal = lastElem.num;
+                lastElem.num -= 1;
+                return Value(oldVal);
+
+            } else {
+                std::cerr &lt;&lt; "Decrement only valid on numbers or arrays\n";
+                return Value(0);
+              }
+            }
+
+            if (peek().type == TTokenType::PowerSelf) {
+              get();  // consume '**'
+              auto it = vars.find(t.text);
+              if (it == vars.end()) {
+                  std::cerr &lt;&lt; "Undefined variable: " &lt;&lt; t.text &lt;&lt; "\n";
+                  return Value(0);
+              }
+              if (it-&gt;second.kind != Value::NUM) {
+                  std::cerr &lt;&lt; "Square assignment only valid on numbers\n";
+                  return Value(0);
+              }
+              it-&gt;second.num = it-&gt;second.num * it-&gt;second.num;
+              return it-&gt;second;  // return updated value
+            }
+
+            return it-&gt;second;
+        }
+
+        if (t.type==TTokenType::LParen) {
+            get();
+            Value v = parseExpr(0);
+            consume(TTokenType::RParen);
+            return v;
+        }
+       
+        if (t.type == TTokenType::LBracket) {
+            get(); // consume '['
+            std::vector&lt;Value&gt; elements;
+            if (peek().type != TTokenType::RBracket) {
+                do {
+                    elements.push_back(parseExpr(0));
+                } while (peek().type == TTokenType::Comma && (get(), true));
+            }
+            consume(TTokenType::RBracket);
+            return Value(std::move(elements));
+        }
+
+        // fallback
+        get();
+        return Value();
+    }
+};
+
+// 1) Define the static member:
+std::unordered_map&lt;std::string,std::vector&lt;std::pair&lt;std::string,std::string&gt;&gt;&gt;
+  Parser::structDefs;
+
+// 2) Implement Value::makeStruct at namespace scope:
+Value Value::makeStruct(
+    const std::string& structName,
+    const std::vector&lt;Value&gt;& args)
+{
+    Value v;
+    v.kind = Value::Kind::STRUCT;  
+
+    auto it = Parser::structDefs.find(structName);
+    if (it == Parser::structDefs.end()) {
+        std::cerr &lt;&lt; "Unknown struct " &lt;&lt; structName &lt;&lt; "\n";
+        return v;
+    }
+    const auto& defs = it-&gt;second;
+    for (size_t i = 0; i &lt; defs.size(); ++i) {
+        const auto& [fieldName, fieldType] = defs[i];
+        if (i &lt; args.size()) {
+            v.fields[fieldName] = args[i];
+        } else {
+            if (fieldType == "int")
+                v.fields[fieldName] = Value(0.0);
+            else if (fieldType == "string")
+                v.fields[fieldName] = Value(std::string());
+            else
+                v.fields[fieldName] = Value();
+        }
+    }
+    return v;
+}
+
+// --- START OF PREPROCESSOR CODE ---
+// Helper to check if a character can be part of an identifier
+// (Consistent with lexer's definition of identifier characters)
+static inline bool is_ident_char_for_preprocess(char c) {
+    return isalnum(c) || c == '_';
+}
+
+size_t find_matching_paren(const std::string& str, size_t start) {
+    if (str[start] != '(') return std::string::npos;
+
+    int depth = 1;
+    size_t pos = start + 1;
+
+    while (pos &lt; str.size() && depth &gt; 0) {
+        if (str[pos] == '(') depth++;
+        else if (str[pos] == ')') depth--;
+        pos++;
+    }
+
+    return (depth == 0) ? pos - 1 : std::string::npos;
+}
+
+static inline void preprocess_defines(std::string& source_code) {
+    std::unordered_map&lt;std::string, std::string&gt; define_map;
+    std::unordered_map&lt;std::string, std::vector&lt;std::string&gt;&gt; macro_params;
+
+    std::stringstream input_ss(source_code);
+    std::string line;
+    std::stringstream output_ss_pass1;
+
+    // Pass 1: Collect macros and filter out #define lines
+    while (std::getline(input_ss, line)) {
+        std::string trimmed_line = line;
+        size_t first_char_pos = trimmed_line.find_first_not_of(" \t");
+        if (first_char_pos != std::string::npos) {
+            trimmed_line = trimmed_line.substr(first_char_pos);
+        } else {
+            trimmed_line = ""; // Empty or whitespace-only line
+        }
+
+        if (trimmed_line.rfind("#define", 0) == 0) {
+            // Handle #define
+            std::string rest = trimmed_line.substr(7);
+            rest.erase(0, rest.find_first_not_of(" \t"));
+            size_t name_end = rest.find('(');
+            if (name_end != std::string::npos) {
+                std::string macro_base = rest.substr(0, name_end);
+                macro_base.erase(macro_base.find_last_not_of(" \t") + 1);
+
+                size_t param_end = rest.find(')', name_end);
+                if (param_end != std::string::npos) {
+                    std::string param_list = rest.substr(name_end + 1, param_end - name_end - 1);
+                    std::vector&lt;std::string&gt; params;
+                    std::stringstream param_ss(param_list);
+                    std::string param;
+                    while (std::getline(param_ss, param, ',')) {
+                        param.erase(param.find_last_not_of(" \t") + 1);
+                        param.erase(0, param.find_first_not_of(" \t"));
+                        params.push_back(param);
+                    }
+                    macro_params[macro_base] = params;
+                    std::string macro_body = rest.substr(param_end + 1);
+                    define_map[macro_base] = macro_body;
+                }
+            } else {
+                std::stringstream line_ss(rest);
+                std::string macro_name;
+                line_ss &gt;&gt; macro_name;
+                std::string macro_body;
+                std::getline(line_ss, macro_body);
+                define_map[macro_name] = macro_body;
+            }
+        } else if (trimmed_line.rfind("#include", 0) == 0) {
+            // Handle #include
+            std::stringstream line_ss(trimmed_line.substr(8)); // Skip "#include"
+            std::string include_path;
+            if (line_ss &gt;&gt; include_path) {
+                // Check for __macr__
+                bool import_macros = false;
+                size_t macr_pos = include_path.find("__macr__");
+                if (macr_pos != std::string::npos) {
+                    import_macros = true;
+                    include_path = include_path.substr(0, macr_pos);
+                    include_path.erase(include_path.find_last_not_of(" \t") + 1);
+                }
+
+                // Remove quotes if present
+                if (include_path.front() == '"' && include_path.back() == '"') {
+                    include_path = include_path.substr(1, include_path.size() - 2);
+                }
+
+                // Read the included file
+                std::ifstream include_file(include_path);
+                if (include_file) {
+                    std::string included_content((std::istreambuf_iterator&lt;char&gt;(include_file)),
+                                                 std::istreambuf_iterator&lt;char&gt;());
+                    if (import_macros) {
+                        // Recursively preprocess the included file for macros
+                        preprocess_defines(included_content);
+
+                        // Merge macros from the included file
+                        std::stringstream included_ss(included_content);
+                        std::string included_line;
+                        while (std::getline(included_ss, included_line)) {
+                            if (included_line.rfind("#define", 0) == 0) {
+                                std::string rest = included_line.substr(7);
+                                rest.erase(0, rest.find_first_not_of(" \t"));
+                                size_t name_end = rest.find('(');
+                                if (name_end != std::string::npos) {
+                                    std::string macro_base = rest.substr(0, name_end);
+                                    macro_base.erase(macro_base.find_last_not_of(" \t") + 1);
+
+                                    size_t param_end = rest.find(')', name_end);
+                                    if (param_end != std::string::npos) {
+                                        std::string param_list = rest.substr(name_end + 1, param_end - name_end - 1);
+                                        std::vector&lt;std::string&gt; params;
+                                        std::stringstream param_ss(param_list);
+                                        std::string param;
+                                        while (std::getline(param_ss, param, ',')) {
+                                            param.erase(param.find_last_not_of(" \t") + 1);
+                                            param.erase(0, param.find_first_not_of(" \t"));
+                                            params.push_back(param);
+                                        }
+                                        macro_params[macro_base] = params;
+                                        std::string macro_body = rest.substr(param_end + 1);
+                                        define_map[macro_base] = macro_body;
+                                    }
+                                } else {
+                                    std::stringstream line_ss(rest);
+                                    std::string macro_name;
+                                    line_ss &gt;&gt; macro_name;
+                                    std::string macro_body;
+                                    std::getline(line_ss, macro_body);
+                                    define_map[macro_name] = macro_body;
+                                }
+                            }
+                        }
+                    } else {
+                        output_ss_pass1 &lt;&lt; included_content &lt;&lt; '\n';
+                    }
+                } else {
+                    std::cerr &lt;&lt; "Error: Cannot open included file: " &lt;&lt; include_path &lt;&lt; '\n';
+                }
+            }
+        } else {
+            output_ss_pass1 &lt;&lt; line &lt;&lt; '\n';
+        }
+    }
+
+    source_code = output_ss_pass1.str();
+
+    // Pass 2: Expand macros using regex
+    for (const auto& [macro_name, macro_body] : define_map) {
+        std::string pattern = R"(\b)" + macro_name + R"(\()";
+        std::regex macro_regex(pattern);
+
+        std::smatch matches;
+        std::string result;
+
+        std::regex_iterator&lt;std::string::iterator&gt; rit(source_code.begin(), source_code.end(), macro_regex);
+        std::regex_iterator&lt;std::string::iterator&gt; rend;
+
+        std::string::iterator last_pos = source_code.begin();
+        while (rit != rend) {
+            result.append(last_pos, rit-&gt;prefix().second);
+
+            size_t start = rit-&gt;position();
+            size_t param_start = start + macro_name.length();
+            size_t param_end = find_matching_paren(source_code, param_start);
+            if (param_end == std::string::npos) {
+                result.append(rit-&gt;str());
+                last_pos = rit-&gt;suffix().first;
+                ++rit;
+                continue;
+            }
+
+            std::string args_str = source_code.substr(param_start + 1, param_end - param_start - 1);
+            std::vector&lt;std::string&gt; args;
+            std::stringstream arg_ss(args_str);
+            std::string arg;
+            while (std::getline(arg_ss, arg, ',')) {
+                arg.erase(arg.find_last_not_of(" \t") + 1);
+                arg.erase(0, arg.find_first_not_of(" \t"));
+                args.push_back(arg);
+            }
+
+            std::string expanded_body = macro_body;
+            const auto& params = macro_params.count(macro_name) ? macro_params[macro_name] : std::vector&lt;std::string&gt;{};
+
+            for (size_t i = 0; i &lt; params.size() && i &lt; args.size(); ++i) {
+                std::string param = params[i];
+                std::regex param_regex(R"(\b)" + param + R"(\b)");
+                expanded_body = std::regex_replace(expanded_body, param_regex, args[i]);
+            }
+
+            result += expanded_body;
+            last_pos = source_code.begin() + param_end + 1;
+            ++rit;
+        }
+
+        result.append(last_pos, source_code.end());
+        source_code = result;
+    }
+}
+// --- END OF PREPROCESSOR CODE ---
+
+// ——— Main ——————————————————————————————————————————————————————————
+int main(int argc, char* argv[]) {
+    std::unordered_map&lt;std::string,Value&gt; vars;
+    std::unordered_map&lt;std::string,std::string&gt; types;
+    std::unordered_map&lt;std::string,FuncPtr&gt; funcs;
+    std::unordered_map&lt;std::string, FunctionDef&gt; userFuncs;
+    // (no need to keep 'imports' anymore)
+    
+    // 1) Always register core built‑ins:
+    funcs["print"] = &printFn;
+    funcs["input"] = &inputFn;
+    funcs["contain"] = &containsFn;
+
+    heap.reserve(1024 * 1024);           // reserve 1 MiB
+    blocks.push_back({0, heap.capacity(), true});
+
+    bool replMode = true;
+    std::string scriptPath;
+    if (argc &gt;= 2) {
+        std::string arg = argv[1];
+        if (arg != "--console") {
+            replMode = false;
+            scriptPath = arg;
+        }
+    }
+
+    // flag to ensure we add cint/cstr exactly once
+    bool typeEnabled = false;
+    const std::string imp = "import type;";
+
+    if (!replMode) {
+        // —— Script mode ——
+        std::ifstream in(scriptPath);
+        if (!in) {
+            std::cerr &lt;&lt; "Error: cannot open file '" &lt;&lt; scriptPath &lt;&lt; "'\n";
+            return 1;
+        }
+        std::string buffer((std::istreambuf_iterator&lt;char&gt;(in)),
+                            std::istreambuf_iterator&lt;char&gt;());
+
+        preprocess_defines(buffer);
+        // If there are any #define directives left, run preprocess again
+        if (buffer.find("#define") != std::string::npos) {
+            preprocess_defines(buffer);
+        }
+
+        // now lex & parse
+        Lexer lex(buffer);
+        std::vector&lt;Token&gt; toks;
+        while (true) {
+            auto t = lex.next();
+            toks.push_back(t);
+            if (t.type == TTokenType::EOF_T) break;
+        }
+        Parser p(std::move(toks), vars, types, funcs, userFuncs);
+        while (p.peek().type != TTokenType::EOF_T) {
+        p.parseStmt();
+}
+
+    } else {
+        // —— REPL mode ——
+        std::string buffer;
+        int braceDepth = 0;
+
+        while (true) {
+            std::cout &lt;&lt; (braceDepth&gt;0?". ":"&gt; ");
+            std::string line;
+            if (!std::getline(std::cin, line)) break;
+            buffer += line + "\n";
+
+            // track braces
+            for (char c : line) {
+                if (c=='{') ++braceDepth;
+                else if (c=='}') --braceDepth;
+            }
+            if (braceDepth &gt; 0) 
+                continue;  // keep reading
+
+            preprocess_defines(buffer);
+
+            // lex & parse this chunk
+            Lexer lex(buffer);
+            std::vector&lt;Token&gt; toks;
+            while (true) {
+                auto t = lex.next();
+                toks.push_back(t);
+                if (t.type == TTokenType::EOF_T) break;
+            }
+            Parser p(std::move(toks), vars, types, funcs, userFuncs);
+            while (p.peek().type != TTokenType::EOF_T) {
+            p.parseStmt();
+            }
+            buffer.clear();
+        }
+    }
+
+    return 0;
+}
+        </pre>
     </section>
     
     <footer>
