@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Toy Language Documentation</title>
+    <style>
+        :root {
+            --primary: #2c3e50;
+            --secondary: #3498db;
+            --accent: #e74c3c;
+            --light: #ecf0f1;
+            --dark: #1a252f;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f5f7fa;
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        header {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 2rem;
+            border-radius: 10px;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+        }
+        
+        .subtitle {
+            font-size: 1.2rem;
+            opacity: 0.9;
+            margin-bottom: 1.5rem;
+        }
+        
+        .badge {
+            display: inline-block;
+            background-color: var(--accent);
+            color: white;
+            padding: 0.3rem 0.6rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            margin-right: 0.5rem;
+        }
+        
+        nav {
+            background-color: white;
+            border-radius: 10px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+        }
+        
+        nav ul {
+            display: flex;
+            flex-wrap: wrap;
+            list-style: none;
+            gap: 15px;
+        }
+        
+        nav a {
+            display: block;
+            padding: 0.6rem 1.2rem;
+            background-color: var(--light);
+            border-radius: 5px;
+            text-decoration: none;
+            color: var(--dark);
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        
+        nav a:hover {
+            background-color: var(--secondary);
+            color: white;
+            transform: translateY(-2px);
+        }
+        
+        section {
+            background-color: white;
+            border-radius: 10px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+        }
+        
+        h2 {
+            color: var(--primary);
+            border-bottom: 2px solid var(--secondary);
+            padding-bottom: 0.5rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        h3 {
+            color: var(--secondary);
+            margin: 1.2rem 0 0.8rem;
+        }
+        
+        pre {
+            background-color: #2d2d2d;
+            color: #f8f8f2;
+            padding: 1rem;
+            border-radius: 5px;
+            overflow-x: auto;
+            margin: 1rem 0;
+            font-family: 'Fira Code', monospace;
+            font-size: 0.95rem;
+        }
+        
+        code {
+            background-color: #eef;
+            color: #d14;
+            padding: 0.2rem 0.4rem;
+            border-radius: 3px;
+            font-family: 'Fira Code', monospace;
+            font-size: 0.95rem;
+        }
+        
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 1.5rem;
+            margin-top: 1.5rem;
+        }
+        
+        .feature-card {
+            background-color: var(--light);
+            border-radius: 8px;
+            padding: 1.2rem;
+            border-left: 4px solid var(--secondary);
+            transition: transform 0.3s ease;
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .feature-card h4 {
+            color: var(--primary);
+            margin-bottom: 0.5rem;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.5rem 0;
+        }
+        
+        th, td {
+            padding: 0.8rem;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        th {
+            background-color: var(--primary);
+            color: white;
+        }
+        
+        tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+        
+        .example-container {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin: 1.5rem 0;
+        }
+        
+        .example-card {
+            flex: 1;
+            min-width: 300px;
+            background-color: var(--light);
+            border-radius: 8px;
+            padding: 1.2rem;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        
+        .example-card h4 {
+            color: var(--secondary);
+            margin-bottom: 0.8rem;
+        }
+        
+        .note {
+            background-color: #e3f2fd;
+            border-left: 4px solid var(--secondary);
+            padding: 1rem;
+            margin: 1.5rem 0;
+            border-radius: 0 5px 5px 0;
+        }
+        
+        footer {
+            text-align: center;
+            padding: 2rem;
+            color: var(--dark);
+            font-size: 0.9rem;
+        }
+        
+        @media (max-width: 768px) {
+            nav ul {
+                flex-direction: column;
+            }
+            
+            .feature-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Toy Language Documentation</h1>
+        <p class="subtitle">A lightweight, extensible scripting language for versatile applications</p>
+        <div>
+            <span class="badge">v1.0</span>
+            <span class="badge">Windows/OpenGL Support</span>
+            <span class="badge">Tail Call Optimization</span>
+            <span class="badge">REPL Mode</span>
+        </div>
+    </header>
+    
+    <nav>
+        <ul>
+            <li><a href="#overview">Overview</a></li>
+            <li><a href="#features">Features</a></li>
+            <li><a href="#syntax">Syntax</a></li>
+            <li><a href="#modules">Modules</a></li>
+            <li><a href="#preprocessor">Preprocessor</a></li>
+            <li><a href="#advanced">Advanced Features</a></li>
+            <li><a href="#examples">Examples</a></li>
+        </ul>
+    </nav>
+    
+    <section id="overview">
+        <h2>Overview</h2>
+        <p>The Toy Language is a lightweight, extensible scripting language designed for simplicity and versatility. It supports a variety of features including custom data types, control structures, user-defined functions, and integration with external libraries such as Windows API and OpenGL.</p>
+        
+        <div class="note">
+            <p><strong>Note:</strong> Toy is an interpreted language with both REPL (interactive console) and script execution modes.</p>
+        </div>
+    </section>
+    
+    <section id="features">
+        <h2>Core Features</h2>
+        <div class="feature-grid">
+            <div class="feature-card">
+                <h4>Data Types</h4>
+                <p>Supports integers, floating-point numbers, strings, arrays, structs, and pointers for low-level operations.</p>
+            </div>
+            
+            <div class="feature-card">
+                <h4>Control Structures</h4>
+                <p>Conditional statements (if/elif/else), loops (while, for), and switch-case statements for program flow control.</p>
+            </div>
+            
+            <div class="feature-card">
+                <h4>Functions</h4>
+                <p>Built-in functions for common tasks and user-defined functions with support for parameters and return values.</p>
+            </div>
+            
+            <div class="feature-card">
+                <h4>Modules</h4>
+                <p>Importable modules for math, string manipulation, arrays, memory management, Windows API, and OpenGL.</p>
+            </div>
+            
+            <div class="feature-card">
+                <h4>Operators</h4>
+                <p>Arithmetic, logical, comparison, and custom operators including <code>+=</code>, <code>**</code> (square), <code>++</code>, and <code>--</code>.</p>
+            </div>
+            
+            <div class="feature-card">
+                <h4>Memory Management</h4>
+                <p>Direct memory allocation and manipulation with <code>malloc</code>, <code>free</code>, <code>store8</code>, and <code>load8</code> functions.</p>
+            </div>
+            
+            <div class="feature-card">
+                <h4>Memory Management</h4>
+                <p>Direct memory allocation and manipulation with <code>malloc</code>, <code>free</code>, <code>store8</code>, and <code>load8</code> functions.</p>
+            </div>
+        </div>
+    </section>
+    
+    <section id="syntax">
+        <h2>Language Syntax</h2>
+        
+        <h3>Variables</h3>
+        <p>Variables are declared with a type and initialized with a value:</p>
+        <pre>int x = 10;       // Integer
+str name = "Toy"; // String
+arr numbers = [1, 2, 3]; // Array</pre>
+        
+        <h3>Structs</h3>
+        <p>Structs allow you to define custom data types with named fields:</p>
+        <pre>struct Point {
+    int x;
+    int y;
+};
+
+Point p = Point(10, 20);
+print(p.x); // Access struct fields</pre>
+        
+        <h3>Control Structures</h3>
+        <div class="example-container">
+            <div class="example-card">
+                <h4>If-Else</h4>
+                <pre>if (x > 5) {
+    print("x is greater than 5");
+} elif (x == 5) {
+    print("x is equal to 5");
+} else {
+    print("x is less than 5");
+}</pre>
+            </div>
+            
+            <div class="example-card">
+                <h4>While Loop</h4>
+                <pre>int i = 0;
+while (i < 5) {
+    print(i);
+    i++;
+}</pre>
+            </div>
+            
+            <div class="example-card">
+                <h4>For Loop</h4>
+                <pre>for (int i = 0; i < 5; i++) {
+    print(i);
+}</pre>
+            </div>
+            
+            <div class="example-card">
+                <h4>Switch</h4>
+                <pre>switch (x) {
+    case 1 {
+        print("x is 1");
+        break;
+    }
+    case 2 {
+        print("x is 2");
+        break;
+    }
+    default {
+        print("x is unknown");
+    }
+}</pre>
+            </div>
+        </div>
+        
+        <h3>Functions</h3>
+        <div class="example-container">
+            <div class="example-card">
+                <h4>Built-in Functions</h4>
+                <pre>print("Hello, World!"); // Print values
+str name = input("Enter your name: "); // Read input
+print(contains("Hello", "lo")); // Output: 1</pre>
+            </div>
+            
+            <div class="example-card">
+                <h4>User-Defined Functions</h4>
+                <pre>int add(int a, int b) {
+    return a + b;
+}
+
+print(add(5, 10)); // Output: 15</pre>
+            </div>
+        </div>
+    </section>
+    
+    <section id="modules">
+        <h2>Modules</h2>
+        
+        <h3>Math Module</h3>
+        <pre>import math;
+print(round(3.14)); // Output: 3
+print(sqrt(16));    // Output: 4</pre>
+        
+        <h3>String Module</h3>
+        <pre>import string;
+print(up("hello"));       // Output: HELLO
+print(trim("  hello  ")); // Output: hello</pre>
+        
+        <h3>Array Module</h3>
+        <pre>import array;
+arr numbers = [1, 2, 3];
+numbers = push(numbers, 4);
+print(numbers); // Output: [1, 2, 3, 4]</pre>
+        
+        <h3>Memory Module</h3>
+        <pre>import memory;
+ptr p = malloc(10);
+store8(p, 0, 42);
+print(load8(p, 0)); // Output: 42
+free(p);</pre>
+        
+        <h3>Windows API Module</h3>
+        <pre>import winapi;
+winmsgBox("Title", "Message");</pre>
+        
+        <h3>OpenGL Module</h3>
+        <pre>import opengl;
+GLContext ctx = GLContext(window);
+glBegin(0x0004); // GL_TRIANGLES
+glVertex3f(0, 0, 0);
+glEnd();</pre>
+    </section>
+    
+    <section id="preprocessor">
+        <h2>Preprocessor Directives</h2>
+        <p>Toy includes a C-like preprocessor for macros and file inclusion.</p>
+        
+        <h3>Macros</h3>
+        <pre>#define PI 3.14159
+#define SQUARE(x) ((x) * (x))
+
+print(SQUARE(5)); // Output: 25</pre>
+        
+        <h3>File Inclusion</h3>
+        <pre>#include "math_utils.toy"
+#include "graphics.toy" __macr__  // Import macros</pre>
+        
+        <div class="note">
+            <p><strong>Note:</strong> The <code>__macr__</code> flag imports macros from the included file.</p>
+        </div>
+    </section>
+    
+    <section id="advanced">
+        <h2>Advanced Features</h2>
+        
+        <h3>Tail Call Optimization</h3>
+        <p>Efficient recursion support through tail call optimization:</p>
+        <pre>int factorial(int n, int acc) {
+    if (n == 0) return acc;
+    return factorial(n - 1, n * acc);
+}
+
+print(factorial(5, 1)); // Output: 120</pre>
+        
+        <h3>Struct Field Operations</h3>
+        <p>Direct operations on struct fields:</p>
+        <pre>p.x += 5; // Increment the `x` field of struct `p`</pre>
+        
+        <h3>Memory Management</h3>
+        <p>Direct memory manipulation:</p>
+        <pre>ptr p = malloc(100);
+store8(p, 0, 255);
+print(load8(p, 0)); // Output: 255
+free(p);</pre>
+        
+        <h3>Bitwise Operations</h3>
+        <pre>int flags = 0;
+flags = flags | 0x80;   // Set bit
+mask = 0xFF & ~0x0F;   // Clear lower 4 bits</pre>
+    </section>
+    
+    <section id="examples">
+        <h2>Example Programs</h2>
+        
+        <h3>Simple Program</h3>
+        <pre>import math;
+import string;
+
+int x = 10;
+str name = "Toy";
+
+if (x > 5) {
+    print(up(name) + " is fun!");
+}
+
+arr numbers = [1, 2, 3];
+numbers = push(numbers, 4);
+print(numbers);
+
+ptr p = malloc(10);
+store8(p, 0, 42);
+print(load8(p, 0));
+free(p);</pre>
+        
+        <h3>Windows GUI Example</h3>
+        <pre>import winapi;
+
+// Create window
+double hwnd = winCreateWindow("Toy App", 800, 600);
+
+// Message loop
+while (1) {
+    if (winPollEvents()) break;
+    // Drawing code here
+}</pre>
+        
+        <h3>OpenGL Graphics</h3>
+        <pre>import opengl;
+
+// Create OpenGL context
+GLContext ctx = GLContext(window);
+
+// Render loop
+while (1) {
+    glClear(0.2, 0.3, 0.3, 1.0);
+    glBegin(0x0004); // GL_TRIANGLES
+    glColor3f(1.0, 0.0, 0.0);
+    glVertex3f(-0.5, -0.5, 0.0);
+    glColor3f(0.0, 1.0, 0.0);
+    glVertex3f(0.5, -0.5, 0.0);
+    glColor3f(0.0, 0.0, 1.0);
+    glVertex3f(0.0, 0.5, 0.0);
+    glEnd();
+    glswapBuffers(window);
+}</pre>
+    </section>
+    
+    <footer>
+        <p>Toy Language Documentation &copy; 2023 | Version 1.0</p>
+        <p>For more information and updates, visit the official repository.</p>
+    </footer>
+</body>
+</html>
+```
